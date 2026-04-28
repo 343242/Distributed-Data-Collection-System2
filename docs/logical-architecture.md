@@ -1,59 +1,100 @@
 # 分布式数据采集系统逻辑架构方案
 
+## 版本记录
+
+| 版本 | 日期 | 说明 |
+|------|------|------|
+| v0.1 | 2026-04-29 | 建立第一版逻辑架构骨架，明确 Customer、Gateway、Agent、CollectorTask、ConnectorInstance、LocalBuffer、至少一次语义和第一版边界。 |
+| v0.2 | 2026-04-29 | 根据两份 v0.1 评审补强对象模型、状态收敛、可靠性原子性、批次与 ACK、Gateway HA、LocalBuffer、安全、运维和版本兼容规则。 |
+| v0.3 | 2026-04-29 | 补充工业过程点高频采集容量基线、本地二进制流缓存模型、Gateway 接入吞吐目标和 Agent 上传削峰填谷策略。 |
+
 ## 1. 设计目标
 
 本系统用于统一管理部署在客户现场的采集节点，通过中心侧 `Gateway` 对客户现场 `Agent` 进行纳管、配置下发、程序包下发、任务启停、运行监控和数据接入，最终将采集数据写入中心数据存储，供业务系统使用。
 
 第一版设计目标是：
 
-- 支持多个客户，每个客户可部署多个 `Agent`
-- 每个 `Agent` 可运行多个 `ConnectorInstance`
-- `Gateway` 作为统一控制入口和数据接入入口
-- `Agent` 负责现场执行、Connector 管理、本地可靠缓冲和恢复上传
-- 数据采集语义采用 `至少一次`
-- 尽最大可能避免数据静默丢失，允许重复数据
-- 第一版不实现自动动态分发，但预留后续演进能力
+- 支持多个客户，每个客户可部署多个 `Agent`。
+- 每个 `Agent` 可运行多个 `ConnectorInstance`。
+- `Gateway` 作为统一入口，内部拆分为控制面和数据接入面。
+- `Agent` 负责客户现场执行、Connector 生命周期管理、本地可靠缓冲和恢复上传。
+- 数据链路采用 `至少一次` 语义，允许重复，尽最大可能避免静默丢失。
+- 面向工业过程点采集场景，第一版容量基线按少量高密度 Agent 设计，而不是大量低密度 Agent 设计。
+- 第一版不实现自动动态分发、严格 exactly-once、批次内断点续传和自动任务迁移，但为后续演进预留模型能力。
+
+本方案是逻辑架构设计，不替代详细设计。涉及容量数值、具体协议实现、存储产品选型和运维部署参数时，本文只定义必须满足的逻辑约束和决策点，不凭空给出未经业务确认的数值。
 
 ## 2. 总体逻辑架构
 
 系统整体由以下核心逻辑域组成：
 
-- `Customer`：系统一级租户边界，用于划分客户、Agent、任务、数据、权限和监控视图。
+- `Customer`：系统一级租户边界，用于划分客户、Agent、任务、数据、权限、资源配额和监控视图。
 - `Gateway`：公司内部中心服务，对外作为统一入口，内部逻辑拆分为控制面和数据接入面。
-- `Agent`：部署在客户现场的独立服务器，负责本客户现场 Connector 的生命周期管理、本地数据缓冲、状态上报和数据上传。
+- `Agent`：部署在客户现场的独立服务器，负责本客户现场 Connector 生命周期管理、本地数据缓冲、状态上报和数据上传。
 - `Connector`：实际执行数据采集的程序。不同类型 Connector 对应不同程序包，同一程序包可按任务启动多个实例。
-- `数据存储`：中心侧持久化存储，保存 Gateway 接入后的采集数据。
+- `LocalBuffer`：Agent 本地可靠缓冲，承接 Connector 采集结果并支持断网、重启和 Gateway 短暂不可用时的恢复上传。
+- `GatewayMetadataStore`：中心侧元数据存储，保存 Customer、Agent、任务、分配关系、版本、Checkpoint、审计和包注册表等控制面数据。
+- `IdempotencyStore`：中心侧幂等记录存储，保存数据接入时用于重复识别的幂等键和必要摘要。
+- `数据存储`：中心侧采集数据持久化存储，保存 Gateway 接入后的业务数据。
 - `业务系统`：从数据存储读取数据，不直接依赖 Agent 或 Connector。
 
 系统核心链路为：
 
 ```text
-控制链路：Gateway -> Agent -> ConnectorInstance
-数据链路：ConnectorInstance -> Agent LocalBuffer -> Gateway -> 数据存储
-监控链路：Agent -> Gateway
+控制链路：Gateway Control Plane -> Agent -> ConnectorInstance
+数据链路：ConnectorInstance -> Agent LocalBuffer -> Gateway Ingest Plane -> 数据存储
+监控链路：Agent -> Gateway Control Plane
+日志链路：Gateway 下发采集请求 -> Agent 主动上传日志片段
 ```
+
+第一版中，`Gateway Control Plane` 与 `Gateway Ingest Plane` 可以物理同进程部署，但逻辑上必须隔离：
+
+- 独立 API 边界。
+- 独立鉴权和错误码。
+- 独立限流和熔断。
+- 独立监控指标。
+- 支持后续拆成独立服务和独立扩缩容。
+
+控制面是低频、强治理链路，风险主要是配置错误、权限错误和状态不一致。数据接入面是高频、大流量链路，风险主要是吞吐瓶颈、存储失败、重试风暴和租户间资源争用。两者不能在逻辑上混为一个不可拆分模块。
 
 ## 3. 核心对象模型
 
-系统核心对象关系为：
+系统核心对象关系调整为：
 
 ```text
-Customer -> Agent -> CollectorTask -> ConnectorInstance
+Customer
+├── Agent
+├── DataSource
+│   └── Point
+├── CollectorTask
+│   ├── assignedAgentId
+│   ├── assignmentVersion
+│   ├── desiredStateVersion
+│   └── currentConnectorInstanceId
+└── ConnectorType / ConnectorPackageVersion
 ```
 
-`Customer` 是客户租户对象，是数据隔离、权限隔离和任务归属的一级边界。
+`Customer` 是客户租户对象，是数据隔离、权限隔离、资源配额和任务归属的一级边界。
 
 `Agent` 属于某个 `Customer`，表示客户现场的一台受管采集节点。
 
-`CollectorTask` 是最小控制单元，表示“一个数据源 + 一套采集配置”。任务由 Gateway 创建并分配给某个 Agent。
+`DataSource` 表示被采集的数据源或源端访问点。它用于承载数据源地址、数据源类型、连通性、凭证引用和权限审计。多个 `CollectorTask` 可以引用同一个 `DataSource`。
+
+`Point` 表示工业过程点、测点或传感器点位。一个 `DataSource` 可以包含多个 `Point`。高密度工业采集场景下，不能把每个 Point 建模为一个 CollectorTask，否则任务、状态、日志、Checkpoint 和 Gateway 元数据都会膨胀。
+
+`CollectorTask` 是最小控制单元，表示“一个数据源引用或设备组 + 一套采集配置 + 一个 ConnectorType + 一个任务配置版本”。任务属于 `Customer`，通过 `assignedAgentId` 分配给某个 Agent，而不是 Agent 的强子对象。一个 CollectorTask 可以覆盖一个 DataSource 下的一组 Point。
 
 `ConnectorInstance` 是任务在 Agent 上的实际运行实例。第一版采用 `1 CollectorTask : 1 ConnectorInstance`。
 
-`ConnectorType` 表示采集器类型。
+`ConnectorType` 表示采集器类型，例如 `mysql-binlog`、`http-polling`、`file-tail`。
 
-`ConnectorPackage` 表示某个 ConnectorType 的具体程序包版本。
+`ConnectorPackageVersion` 表示某个 `ConnectorType` 的具体程序包版本，例如 `mysql-binlog:1.3.2`。
 
-`LocalBuffer` 是 Agent 本地可靠缓冲组件，所有采集数据必须先进入本地缓冲，再上传 Gateway。
+`TaskConfigVersion` 表示任务采集配置版本，与程序包版本分离。
+
+`LocalBuffer` 是 Agent 本地可靠缓冲组件。所有采集数据必须先进入本地缓冲，再上传 Gateway。
+
+这种模型避免把 `CollectorTask` 绑定死在某个 Agent 下，为后续手动迁移、自动调度、Agent 替换和故障恢复保留空间。
 
 ## 4. Gateway 逻辑职责
 
@@ -61,82 +102,180 @@ Gateway 对外是统一入口，内部按控制面和数据接入面拆分。
 
 控制面职责：
 
-- Customer 管理
-- Agent 注册、审批、发现和状态管理
-- CollectorTask 创建、分配、启停和配置管理
-- ConnectorPackage 管理、版本管理和下发
-- Agent、Task、ConnectorInstance 监控汇总
-- 告警、审计、运维视图
-- 为后续动态分发预留调度能力
+- Customer 管理和租户隔离。
+- Agent 注册、审批、发现、禁用和状态管理。
+- DataSource 管理、连通性检测和凭证引用管理。
+- CollectorTask 创建、分配、启停和配置版本管理。
+- ConnectorType、ConnectorPackageVersion 管理、版本管理和下发。
+- 维护任务期望状态、分配关系、assignmentVersion、desiredStateVersion、TaskConfigVersion 和 ConnectorPackageVersion。
+- Agent、Task、ConnectorInstance、LocalBuffer 监控汇总。
+- 告警、审计、运维视图。
+- 为后续动态分发预留调度能力。
 
 数据接入面职责：
 
-- 接收 Agent 上传的数据批次
-- 校验 Customer、Agent、Task 归属关系
-- 校验批次和记录协议
-- 基于幂等键识别重复数据
-- 写入数据存储
-- 返回明确 ACK
+- 接收 Agent 上传的数据批次。
+- 校验 Customer、Agent、Task、assignmentVersion 和任务归属关系。
+- 校验批次协议、数据 Envelope 和记录协议版本。
+- 基于幂等键识别重复数据。
+- 保证采集数据写入与幂等记录写入的一致性边界。
+- 写入数据存储。
+- 返回明确 ACK。
+
+Gateway HA 原则：
+
+- 控制面和数据接入面均应按无状态服务设计。
+- 状态保存在 `GatewayMetadataStore`、`IdempotencyStore` 和数据存储中。
+- Agent 通过固定域名或负载均衡入口访问 Gateway。
+- 任意 Ingest 实例应能处理任意 Agent 的上传批次。
+- Gateway 实例故障不应导致已持久化元数据或幂等状态丢失。
+- 数据面过载不能拖垮控制面，至少要通过独立限流、线程池、连接池或进程隔离实现保护。
+
+`GatewayMetadataStore` 和 `IdempotencyStore` 可以在物理实现上共用数据库或存储集群，但逻辑上必须区分职责。数据存储用于业务采集数据，不应混淆为 Gateway 控制面元数据的唯一建模位置。
 
 ## 5. Agent 逻辑职责
 
-Agent 是客户现场的执行节点和数据缓冲节点，职责包括：
+Agent 是客户现场自治执行节点和数据缓冲节点，职责包括：
 
-- 向 Gateway 注册并维持心跳
-- 接收 Gateway 下发的任务期望状态
-- 下载、校验和管理 ConnectorPackage
-- 启动、停止、重启和监控 ConnectorInstance
-- 接收 ConnectorInstance 采集结果
-- 将采集数据写入本地可靠缓冲
-- 批量上传本地缓冲数据到 Gateway
-- 根据 Gateway ACK 更新批次状态
-- 在 ACK 后推进任务 Checkpoint
-- 上报资源、任务、实例、缓冲、日志和告警摘要
+- 向 Gateway 注册并维持心跳。
+- 拉取或接收 Gateway 下发的任务期望状态。
+- 持久化最近一次已确认的期望状态。
+- 下载、校验和管理 ConnectorPackageVersion。
+- 启动、停止、重启和监控 ConnectorInstance。
+- 向 ConnectorInstance 暴露本地采集写入接口。
+- 接收 ConnectorInstance 采集结果。
+- 为记录生成 `messageId`。
+- 将采集数据写入本地可靠缓冲。
+- 按批次上传本地缓冲数据到 Gateway。
+- 根据 Gateway ACK 更新批次状态。
+- 在满足顺序和原子性条件后推进任务 Checkpoint。
+- 上报资源、任务、实例、缓冲、日志和告警摘要。
 
-Agent 是现场自治单元。Gateway 不直接管理 Connector 进程，而是通过 Agent 下发期望状态。
+Agent 内部逻辑组件包括：
 
-## 6. 任务与实例模型
+- `RegistrationClient`：负责注册、凭证换取、凭证轮换和禁用状态处理。
+- `HeartbeatReporter`：负责心跳、资源指标、状态摘要上报。
+- `DesiredStateCache`：持久化最近一次已确认的任务期望状态和版本。
+- `TaskManager`：负责任务期望状态收敛。
+- `ConnectorProcessManager`：负责 ConnectorInstance 进程生命周期、运行目录和资源限制。
+- `PackageManager`：负责程序包下载、哈希校验、签名校验和本地包仓库。
+- `LocalIngestServer`：负责 ConnectorInstance 到 Agent 的本地提交协议。
+- `LocalBuffer`：负责二进制流可靠写入、段文件、WAL、回放游标、修复和清理。
+- `UploadManager`：负责批次上传、重试、退避、ACK 处理。
+- `UploadRateController`：负责根据积压、Gateway 反馈和本地资源进行削峰填谷。
+- `LogManager`：负责本地日志保留、摘要上报和按需日志片段上传。
+- `OpsToolkit`：负责本地缓存统计、巡检、修复和基准测试工具。
 
-第一版任务模型固定为：
+Agent 是现场自治单元。Gateway 不直接管理 Connector 进程，而是通过 Agent 下发期望状态。Agent 重启且 Gateway 暂时不可用时，可以基于本地持久化的期望状态恢复已确认的 ENABLED 任务，但必须标记为 `DEGRADED`，并在 Gateway 恢复后进行状态对账。对于包、配置或权限无法本地校验的任务，Agent 不应启动。
+
+第一版不实现 Agent 自动升级。Gateway 仅记录 Agent 版本、最低兼容版本和升级告警；Agent 升级由人工或外部运维系统完成。
+
+## 6. Agent 与 ConnectorInstance 本地提交协议
+
+ConnectorInstance 不直接写 LocalBuffer，也不直接持有 Gateway 凭证。
+
+ConnectorInstance 必须通过 Agent 提供的本地采集写入接口提交数据：
+
+```text
+ConnectorInstance -> Agent: append records + checkpointCandidate
+Agent -> ConnectorInstance: append accepted / rejected
+```
+
+本地提交规则：
+
+- Agent 必须校验 `taskId`、`connectorInstanceId`、协议版本、schemaVersion 和任务归属。
+- Agent 为每条记录生成稳定 `messageId`。
+- Agent 将记录、messageId、checkpointCandidate 和必要元数据持久化到 LocalBuffer。
+- 只有 Agent 返回 `append accepted` 后，ConnectorInstance 才能认为该批记录已经进入可靠缓冲。
+- ConnectorInstance 如果维护源端游标，只能将随记录提交的 `checkpointCandidate` 视为候选值，最终任务级 Checkpoint 仍由 Agent 在 Gateway SUCCESS ACK 后推进。
+- Agent 在写入 LocalBuffer 前崩溃时，ConnectorInstance 不得把该批记录视为可靠采集完成。
+
+本地通信可以采用本地 HTTP、gRPC、Unix Domain Socket、SDK 或其他实现方式。逻辑架构不强制具体协议，但必须满足以上提交语义。
+
+## 7. 任务、实例与分配模型
+
+第一版执行模型固定为：
 
 ```text
 1 CollectorTask : 1 ConnectorInstance
 ```
 
-一个 CollectorTask 表示一个数据源和一套采集配置。一个任务在同一时刻只能分配给一个 Agent，并由该 Agent 上的一个 ConnectorInstance 执行。
+一个 CollectorTask 表示一个 DataSource 引用和一套采集配置。一个任务在同一时刻只能分配给一个 Agent，并由该 Agent 上的一个 ConnectorInstance 执行。
+
+工业过程点采集场景中，一个 CollectorTask 可以覆盖多个 Point。Point 是任务内部采集单元，不是第一版控制面最小启停单元。Point 级别的启停、过滤或独立迁移不属于第一版范围。
 
 启停、重试、配置变更、审计均以 CollectorTask 为主粒度。
 
-监控采用双层视图：
+监控采用三层视图：
 
-- 任务级监控：关注采集是否正常、Checkpoint 是否推进、上传是否滞后
-- 实例级监控：关注进程是否存活、资源占用、重启次数和运行错误
+- 任务级监控：关注采集是否正常、Checkpoint 是否推进、上传是否滞后。
+- 实例级监控：关注进程是否存活、资源占用、重启次数和运行错误。
+- 分配级监控：关注 assignmentVersion、assignedAgentId、observedAssignmentVersion 是否收敛。
 
-## 7. 状态模型
+第一版不允许多个 Agent 同时执行同一个 CollectorTask。后续迁移必须通过 assignmentVersion 和迁移状态显式表达，不能通过并发执行隐式完成。
 
-系统采用期望状态和运行状态分离的方式。
+## 8. 状态模型与收敛协议
 
-`DesiredState` 表示 Gateway 期望任务处于什么状态：
+系统采用期望状态、任务运行状态、实例状态和背压状态分离的方式。
 
-- `ENABLED`
-- `DISABLED`
+`DesiredState` 表示 Gateway 对任务的期望：
 
-`RuntimeState` 表示 Agent 上报的实际运行状态：
+- `ENABLED`：任务应运行并继续采集。
+- `DRAINING`：停止采集新数据，但继续上传 LocalBuffer 中的未 ACK 数据。
+- `DISABLED`：任务不应运行；已存在未 ACK 数据仍不得被删除，除非满足清理条件。
 
-- `CREATED`
+`TaskRuntimeState` 表示任务分配与执行层面的状态：
+
+- `UNASSIGNED`
 - `ASSIGNED`
 - `DEPLOYING`
-- `STARTING`
 - `RUNNING`
-- `THROTTLED`
-- `PAUSED_BY_BACKPRESSURE`
-- `STOPPING`
+- `DRAINING`
 - `STOPPED`
 - `FAILED`
 
-Gateway 负责维护期望状态，Agent 负责上报实际状态。两者不一致时，系统进入状态收敛流程。
+`InstanceState` 表示 ConnectorInstance 进程状态：
 
-## 8. 数据可靠性设计
+- `CREATED`
+- `STARTING`
+- `RUNNING`
+- `THROTTLED`
+- `PAUSED`
+- `STOPPING`
+- `EXITED`
+- `CRASHED`
+
+`BackpressureState` 表示 LocalBuffer 和资源压力状态：
+
+- `NORMAL`
+- `HIGH`
+- `CRITICAL`
+- `FULL`
+- `ERROR`
+
+状态收敛规则：
+
+- Gateway 持有 `DesiredState`、`assignedAgentId`、`assignmentVersion`、`desiredStateVersion`、`TaskConfigVersion` 和 `ConnectorPackageVersion`。
+- Agent 只执行版本最新且归属自身的任务指令。
+- Agent 每次状态上报必须携带 `observedAssignmentVersion`、`observedDesiredStateVersion`、`observedTaskConfigVersion` 和 `observedPackageVersion`。
+- Gateway 根据 observed version 判断 Agent 是否已经看到并执行最新期望状态。
+- 旧版本指令不得覆盖新版本指令。
+- 状态收敛超时后，Gateway 应标记任务为收敛异常并告警，不应无限静默重试。
+
+典型风险场景：
+
+```text
+1. Gateway 下发 ENABLED v10。
+2. 网络延迟。
+3. Gateway 下发 DISABLED v11。
+4. Agent 先收到 v11 并停止任务。
+5. Agent 后收到 v10。
+6. Agent 必须拒绝 v10，避免任务被错误重新启动。
+```
+
+因此，`assignmentVersion` 和 `desiredStateVersion` 不是仅为未来动态分发预留，第一版启停控制也必须使用。
+
+## 9. 数据可靠性设计
 
 第一版数据语义确定为：
 
@@ -147,95 +286,285 @@ Gateway 负责维护期望状态，Agent 负责上报实际状态。两者不一
 数据流为：
 
 ```text
-ConnectorInstance -> Agent LocalBuffer -> Gateway -> 数据存储
+ConnectorInstance -> Agent LocalBuffer -> Gateway Ingest Plane -> 数据存储
 ```
 
 处理流程：
 
 1. ConnectorInstance 采集数据。
-2. Agent 为记录生成 `messageId`。
-3. Agent 将数据写入 LocalBuffer。
-4. Agent 按批次上传到 Gateway。
-5. Gateway 写入数据存储。
-6. Gateway 返回持久化 ACK。
-7. Agent 收到 ACK 后标记批次完成。
-8. Agent 推进任务级 Checkpoint。
-9. Agent 后续清理已确认本地缓冲数据。
+2. ConnectorInstance 调用 Agent 本地提交接口，提交记录和 checkpointCandidate。
+3. Agent 校验任务、实例和协议。
+4. Agent 为记录生成 `messageId`。
+5. Agent 将记录、messageId、checkpointCandidate 和批次元数据写入 LocalBuffer。
+6. Agent 返回 `append accepted`。
+7. Agent 将 LocalBuffer 中的数据按批次上传到 Gateway。
+8. Gateway 校验 Customer、Agent、Task、assignmentVersion 和数据协议。
+9. Gateway 以幂等方式写入数据存储。
+10. Gateway 返回批次 ACK。
+11. Agent 收到 SUCCESS ACK 后标记批次完成。
+12. Agent 在满足顺序推进条件后推进任务级 Checkpoint。
+13. Agent 后续清理已确认本地缓冲数据。
 
 关键原则：
 
-- 数据写入 LocalBuffer 后，才算 Agent 侧接住数据
-- Gateway 返回 SUCCESS 后，Agent 才能推进 Checkpoint
-- 未 ACK 数据必须保留在本地缓冲中
-- 部分成功时第一版不做批次内断点续传，采用整批重传
-- Gateway 通过记录级幂等跳过已写成功记录
+- 数据写入 LocalBuffer 后，才算 Agent 侧接住数据。
+- ConnectorInstance 收到 `append accepted` 后，才算该批记录进入可靠缓冲。
+- Gateway 返回 SUCCESS 后，Agent 才能推进 Checkpoint。
+- 未 ACK 数据必须保留在本地缓冲中。
+- 第一版不做批次内断点续传，部分成功或结果不确定时采用整批重传。
+- `RETRYABLE_FAILURE` 不代表没有写入，Agent 必须整批重传，Gateway 必须依赖幂等处理重复。
+- Gateway 通过记录级幂等跳过已写成功记录。
 
-## 9. LocalBuffer 设计
+## 10. 数据 Envelope 与 Schema
 
-Agent 本地缓冲采用：
+Agent 上传到 Gateway 的每条记录必须带统一 Envelope。逻辑字段包括：
 
-```text
-顺序日志 + 嵌入式 KV 索引
-```
-
-逻辑组件包括：
-
-- `AppendLog`：顺序追加保存采集数据和批次内容。
-- `BufferIndex`：保存 batchId、messageId、任务归属、上传状态、重试次数、日志位置、checkpointCandidate。
-- `UploadCursor`：记录任务上传进度、已 ACK 位置和待重传范围。
-- `RetentionManager`：清理已 ACK 且 Checkpoint 已推进的数据。
-- `RepairScanner`：Agent 重启后修复未完成上传状态和索引状态。
-
-本地存储引擎可采用 RocksDB、Pebble 或同类嵌入式持久化引擎。第一版不建议使用 Kafka 作为每个 Agent 的本地缓冲，因为部署、运维和资源负担较重。
-
-## 10. messageId 与幂等设计
-
-`messageId` 由 Agent 在写入本地缓冲时生成。
-
-推荐组成：
-
-```text
-customerId + taskId + agentId + localSequence
+```json
+{
+  "customerId": "...",
+  "agentId": "...",
+  "taskId": "...",
+  "connectorType": "...",
+  "connectorInstanceId": "...",
+  "assignmentVersion": 1,
+  "messageId": "...",
+  "eventTime": "...",
+  "agentIngestTime": "...",
+  "schemaVersion": "...",
+  "payload": {},
+  "checkpointCandidate": {}
+}
 ```
 
 要求：
 
-- localSequence 必须持久化
-- Agent 重启后不能重复生成旧序号
-- 同一条本地缓冲记录重传时 messageId 不变
-- Gateway 使用 `customerId + taskId + messageId` 做记录级幂等
+- `customerId`、`agentId`、`taskId`、`messageId` 是数据接入的基础识别字段。
+- `assignmentVersion` 用于避免旧 Owner 或旧分配关系继续上传。
+- `schemaVersion` 用于表达 Connector 输出数据结构版本。
+- `checkpointCandidate` 由 ConnectorType 自解释，只能作为候选 Checkpoint。
+- Gateway 应记录 `gatewayIngestTime`，用于计算端到端延迟和排查积压。
+
+数据 Schema 演进属于 ConnectorType 的一部分。ConnectorType 修改输出格式时，必须通过 `schemaVersion` 表达，不得在同一版本下改变不兼容语义。
+
+工业过程点高频采集场景中，本地缓存和上传批次不应为每条样本重复存储完整 JSON Envelope。Envelope 是逻辑协议边界，物理传输可以采用批次级公共字段 + 样本级紧凑二进制 payload 的方式表达。样本 payload 中至少需要能表达 point 标识、采集时间、值、质量码或等价业务字段，具体编码由 ConnectorType 和 schemaVersion 定义。
+
+## 11. Batch 模型
+
+Batch 是 Agent 上传到 Gateway 的数据批次。
+
+Batch 逻辑字段包括：
+
+- `batchId`
+- `customerId`
+- `agentId`
+- `taskId`
+- `connectorInstanceId`
+- `assignmentVersion`
+- `recordCount`
+- `byteSize`
+- `firstMessageId`
+- `lastMessageId`
+- `checkpointCandidate`
+- `batchSequence`
+- `createdAt`
+- `uploadAttempt`
+
+`batchId` 由 Agent 生成，必须在同一 Agent 内稳定唯一。同一批次重传时 `batchId` 和记录 `messageId` 保持不变。
+
+第一版为降低 Checkpoint 顺序推进复杂度，采用以下限制：
+
+```text
+同一 CollectorTask 同一时刻只允许一个上传中的 Batch。
+```
+
+该限制避免 Batch 2 先 ACK、Batch 1 后失败时错误推进 Checkpoint。后续如允许单任务并发上传，必须改为“连续 ACK 区间推进”模型。
+
+Batch 状态：
+
+- `PENDING`
+- `UPLOADING`
+- `ACKED`
+- `RETRY_WAIT`
+- `FINAL_FAILED`
+
+Batch 大小限制必须配置化，至少包含：
+
+- 单批最大记录数。
+- 单批最大字节数。
+- 单记录最大字节数。
+- 单任务最大待上传批次数。
+
+工业过程点高频采集场景的建议值：
+
+- 本地写入批次按 `1s` 数据或最多 `10000` 条样本组织。
+- 上传 Replay limit 默认 `50000` 条或 `4MB`，先到为准。
+- 上传 Replay limit 最大 `100000` 条或 `8MB`，先到为准。
+- 正常上传周期为 `1s - 5s`。
+- 同一 CollectorTask 上传并发第一版仍为 `1`。
+- 同一 Agent 上传 worker 默认 `2`，最大 `4`。
+
+## 12. LocalBuffer 设计
+
+工业过程点高频采集场景下，Agent 本地缓冲采用：
+
+```text
+二进制流 Segment + WAL + ReplayCursor
+```
+
+逻辑组件包括：
+
+- `StorageEngine`：对 Agent 提供 `WriteBatch`、`Replay`、`Ack`、`Recover`、`Stats`。
+- `RecordCodec`：将 Connector 提交的业务 payload 封装为二进制记录。
+- `WALManager`：承担写前日志、checkpoint 和崩溃恢复。
+- `SegmentManager`：负责顺序追加段文件、按大小滚动和段尾元数据。
+- `ReplayManager`：按 `writeSeq` 顺序回放未上传数据。
+- `RetentionManager`：清理已 ACK 且满足保留条件的段文件。
+- `RecoveryManager`：负责启动扫描、尾部截断和 WAL 重放。
+- `OpsToolkit`：提供 stats、verify、repair、benchmark 等本地运维工具。
+
+主数据不应逐条写入 KV 存储。KV 或元数据文件只用于保存 cursor、checkpoint、manifest、统计和少量索引。第一版不建议使用 Kafka 作为每个 Agent 的本地缓冲，因为部署、运维和资源负担较重；也不建议用 RocksDB / Pebble 承载每条样本主体数据，除非后续 benchmark 证明 compaction 不影响读写目标。
+
+记录与块模型：
+
+- 每条记录至少包含 `eventTimeUnixMs`、`writeSeq`、`payloadLen`、校验信息和原始 payload。
+- `writeSeq` 由本地存储系统生成，单进程内单调递增。
+- 回放顺序以 `writeSeq` / 物理写入顺序为准，不依赖传感器时间绝对单调。
+- Block 是最小完整写入和校验单元，默认 `1MB`。
+- Block 可配置范围为 `256KB - 4MB`，第一版不把 `16MB` 级大块作为默认值。
+- Segment 默认目标大小为 `256MB`，允许 `4MB` slack，避免最后一个完整 block 被截断。
+
+LocalBuffer 一致性规则：
+
+- 写入链路必须保持顺序追加，主写路径不做复杂随机索引。
+- WAL 已 fsync 后，该批次进入可恢复状态。
+- Segment 已写入并满足刷盘策略后，该批次进入可回放状态。
+- 任何时候都不确认半个 block。
+- WAL checkpoint 默认在新增 `64MB` 或距离上次 checkpoint 达到 `5s` 时触发，segment seal 和进程关闭时强制触发。
+- Segment fsync 默认在新增 `4MB` 或距离上次 fsync 达到 `100ms` 时触发，segment seal 和进程关闭时强制触发。
+- Agent 重启时，`UPLOADING` 批次必须回退为 `PENDING` 或 `RETRY_WAIT`，不得假定已成功。
+- 启动恢复以有效 WAL、有效段尾元数据和完整 block 边界共同仲裁。
+- checkpoint 之后以有效 WAL 为准；footer 之外且无法由有效 WAL 解释的孤立 Segment 尾部数据不保留。
+- 发现同一 `writeSeq` 对应不同 payload 时，视为严重损坏并停止自动恢复。
+
+LocalBuffer 隔离策略：
+
+- 第一版至少保证任务级逻辑隔离，每个任务有独立命名空间、独立 quota、独立状态和独立清理边界。
+- 物理上可以共享一个二进制流存储实例，也可以每任务独立实例；该选择属于详细设计阶段的资源与故障隔离权衡。
+- 无论物理实现如何，单个任务积压不得无限占满 Agent 全局磁盘。
+- 存储损坏影响范围必须可诊断，受影响任务应进入 `FAILED` 或 `DEGRADED` 并告警。
+
+安全删除条件：
+
+一条记录或一个批次可被清理，必须同时满足：
+
+- Gateway 已返回 SUCCESS ACK。
+- 对应记录所属 checkpoint 区间已被任务级 Checkpoint 覆盖。
+- 当前没有 pending retry 或 unresolved partial result。
+- 审计、上传日志和故障排查所需的最低保留要求已满足。
+
+LocalBuffer 第一版必须提供最小运维工具：
+
+- `cachectl stats`
+- `cachectl inspect-segment <id>`
+- `cachectl inspect-wal`
+- `cachectl inspect-cursor <destination>`
+- `cachectl verify`
+- `cachectl repair-tail`
+- `cachectl benchmark`
+- `cachectl close-check`
+
+## 13. messageId 与幂等设计
+
+`messageId` 由 Agent 在写入 LocalBuffer 时生成。
+
+推荐组成：
+
+```text
+messageId = agentId + localSequence
+idempotencyKey = customerId + taskId + messageId
+```
+
+要求：
+
+- `localSequence` 必须持久化。
+- 序列更新与 LocalBuffer 写入必须具备可恢复的一致性关系。
+- Agent 重启后不能重复生成旧序号。
+- 同一条本地缓冲记录重传时 `messageId` 不变。
+- Gateway 使用 `customerId + taskId + messageId` 做记录级幂等。
+- 相同幂等键但 payload 摘要不一致，必须视为高风险异常，返回 FINAL_FAILURE 并告警。
 
 系统级幂等依赖 messageId。业务级去重不由第一版统一保证，如有需要，应由具体 ConnectorType 或下游业务规则基于源端主键、offset、时间戳等处理。
 
-## 11. ACK 语义
+幂等写入一致性规则：
+
+- 数据写入与幂等键记录必须具备原子性或等价的一致性保障。
+- 不允许“幂等键已写入但数据未写入”导致重传被误判为重复。
+- 不允许“数据已写入但幂等键未写入”导致重传产生不可控重复。
+- Gateway 写成功但 ACK 返回失败时，Agent 重传必须由幂等机制正确处理。
+
+如果底层数据存储无法与 IdempotencyStore 提供单事务能力，详细设计必须给出等价方案，例如幂等键与数据同库同事务、数据表内唯一键约束、两阶段状态记录或可恢复写入日志。逻辑架构只规定不得牺牲“不丢”的正确性边界。
+
+## 14. ACK 语义与重试策略
 
 Gateway ACK 分为三类：
 
-- `SUCCESS`：批次内所有记录已写入成功，或重复记录已确认跳过。
-- `RETRYABLE_FAILURE`：结果不确定或临时失败，Agent 应稍后整批重传。
-- `FINAL_FAILURE`：权限、配置、协议、归属关系等不可重试错误，需要人工介入。
+- `SUCCESS`：批次内所有记录已写入成功，或重复记录已确认内容一致并跳过。
+- `RETRYABLE_FAILURE`：结果不确定、临时失败或 Gateway 过载，Agent 应稍后整批重传。
+- `FINAL_FAILURE`：权限、配置、协议、归属关系、幂等冲突且内容不一致等不可重试错误，需要人工介入。
 
 只有 `SUCCESS` 允许 Agent 标记批次为 `ACKED` 并推进 Checkpoint。
 
-## 12. Checkpoint 设计
+典型错误分类：
+
+| 错误类型 | ACK 类型 | Agent 行为 |
+|----------|----------|------------|
+| 存储超时 | RETRYABLE_FAILURE | 指数退避后整批重传 |
+| Gateway 过载 | RETRYABLE_FAILURE | 降速并退避重传 |
+| ACK 返回前连接中断 | RETRYABLE_FAILURE | 整批重传 |
+| 幂等冲突但内容一致 | SUCCESS | 标记 ACKED |
+| 幂等冲突但内容不一致 | FINAL_FAILURE | 停止任务并告警 |
+| Agent 被禁用 | FINAL_FAILURE | 停止上传和控制动作 |
+| Task 不属于该 Agent | FINAL_FAILURE | 停止任务并告警 |
+| 协议版本不兼容 | FINAL_FAILURE 或 RETRYABLE_FAILURE | 根据兼容策略决定 |
+
+重试策略：
+
+- RETRYABLE_FAILURE 必须使用退避策略，避免重试风暴。
+- 退避策略和最大重试间隔必须可配置。
+- 重试不应饿死正常上传，UploadManager 需要在正常批次和重试批次之间做公平调度。
+- 达到最大重试时长或人工配置的失败阈值后，任务应进入告警或 FAILED，不应静默无限重试。
+- RETRYABLE_FAILURE 不保证 Gateway 没有写入，Agent 不得推进 Checkpoint，只能依赖幂等整批重传。
+
+具体退避参数和最大重试时长属于部署参数，需要在容量规划和运维策略中确认。
+
+## 15. Checkpoint 设计
 
 Checkpoint 属于 CollectorTask。
 
 Checkpoint 的具体内容由 ConnectorType 自解释：
 
-- 轮询型 Connector 可使用时间点、主键、水位线
-- 流式 Connector 可使用 offset、sequence、subscription cursor
-- 多游标场景可放在任务级 Checkpoint 的内部结构中
+- 轮询型 Connector 可使用时间点、主键、水位线。
+- 流式 Connector 可使用 offset、sequence、subscription cursor。
+- 多游标场景可放在任务级 Checkpoint 的内部结构中。
 
 Checkpoint 推进规则：
 
 ```text
-只有 Gateway 确认持久化成功后，Agent 才能推进 Checkpoint
+只有 Gateway 确认持久化成功后，Agent 才能推进 Checkpoint。
 ```
 
-Checkpoint 不用于去重，messageId 不用于采集恢复。两者职责必须分离。
+第一版同一任务串行上传 Batch，因此 Checkpoint 只在当前 Batch SUCCESS ACK 后按顺序单调推进。
 
-## 13. 背压策略
+Checkpoint 与 LocalBuffer 清理必须具备一致性：
+
+- Batch 标记 ACKED、Checkpoint 推进和可清理范围更新必须作为可恢复的原子状态变更处理。
+- Agent 崩溃后不得出现 Checkpoint 已推进但对应未 ACK 数据被误删的状态。
+- 如果恢复时无法证明 Checkpoint 推进已完整完成，应保守回到较旧 Checkpoint 并允许重复上传。
+- Checkpoint 不用于去重，messageId 不用于采集恢复。两者职责必须分离。
+
+如果后续允许同一任务并发上传多个 Batch，Checkpoint 推进必须改为连续 ACK 区间模型：只有当前 Checkpoint 之后连续区间内的批次全部 SUCCESS，才能推进。
+
+## 16. 背压策略
 
 LocalBuffer 是背压第一触发点。
 
@@ -249,65 +578,198 @@ LocalBuffer 是背压第一触发点。
 
 策略：
 
-- `NORMAL` 正常采集和上传
-- `HIGH` 继续采集，产生告警，提高上传优先级
-- `CRITICAL` 暂停低优先级或积压贡献较大的任务
-- `FULL` 停止继续写入缓冲的任务，保护磁盘
-- 默认不丢弃数据
+- `NORMAL`：正常采集和上传。
+- `HIGH`：继续采集，产生告警，提高上传优先级。
+- `CRITICAL`：暂停低优先级或积压贡献较大的任务。
+- `FULL`：停止继续写入缓冲的任务，保护磁盘。
+- `ERROR`：缓冲不可用或一致性损坏，受影响任务进入 FAILED 或 DEGRADED。
 
-Agent 可向 ConnectorInstance 下发：
+默认不丢弃数据。Agent 可向 ConnectorInstance 下发：
 
 - `THROTTLE`
 - `PAUSE`
 - `STOP`
 
-每种 ConnectorType 需要声明支持哪些背压动作。不能安全暂停的流式 Connector，在严重背压时允许停止，后续依赖 Checkpoint 恢复，接受重复数据。
+背压动作必须结合 ConnectorType 能力声明，而不是对所有 Connector 统一处理。ConnectorType 至少需要声明：
 
-## 14. 异常恢复策略
+- `replayable`
+- `pauseSupported`
+- `resumeFromCheckpointSupported`
+- `maxSourceRetentionHint`
+- `lossRiskWhenPaused`
+
+示例风险：
+
+| Connector 类型 | 停止或暂停后的风险 |
+|----------------|--------------------|
+| 可重放轮询型 | 通常可从 Checkpoint 恢复 |
+| 数据库 binlog / MQ 流式 | 依赖源端保留期和 offset 可用性 |
+| Webhook / 推送型 | Agent 不接收可能直接丢数据 |
+| 文件 tail 型 | 文件轮转期间可能丢数据 |
+| 无 offset API 的接口 | 可能无法可靠恢复 |
+
+不能安全暂停的 Connector，在严重背压时允许停止，但必须告警，并在恢复后根据 ConnectorType 的恢复能力处理重复或潜在缺口。
+
+## 17. 异常与网络分区恢复策略
 
 Agent 离线：
 
-- Gateway 标记 Agent 为 OFFLINE
-- 不立即把任务改为 STOPPED
-- 不自动迁移任务
-- Agent 恢复后重新上报本地状态
+- Gateway 标记 Agent 为 `OFFLINE`。
+- 不立即把任务改为 `STOPPED`。
+- 不自动迁移任务。
+- Agent 恢复后重新上报本地状态、observed version、未 ACK 数据量和 Checkpoint。
 
 Gateway 不可用：
 
-- 已运行 ConnectorInstance 可继续采集
-- 数据继续进入 LocalBuffer
-- 上传失败批次保持未 ACK
-- Gateway 恢复后继续上传
+- 已运行 ConnectorInstance 可继续采集。
+- 数据继续进入 LocalBuffer。
+- 上传失败批次保持未 ACK。
+- Gateway 恢复后继续上传。
+
+网络分区：
+
+- 心跳失败但本地采集仍运行时，Agent 可继续写入 LocalBuffer。
+- 上传失败但控制链路可用时，Agent 不推进 Checkpoint，并根据背压状态调整采集。
+- 控制链路失败但上传链路可用时，Agent 可继续上传已缓冲数据，但不得执行未知新指令。
+- ACK 丢失时，Agent 视为 RETRYABLE_FAILURE 并整批重传。
+- 分区恢复后，Gateway 以 Agent 上报的 observed version、未 ACK 数据量和 Checkpoint 进行对账。
 
 数据存储失败：
 
-- Gateway 返回 RETRYABLE_FAILURE
-- Agent 不推进 Checkpoint
-- Agent 后续重传
+- Gateway 返回 RETRYABLE_FAILURE。
+- Agent 不推进 Checkpoint。
+- Agent 后续整批重传。
 
 ConnectorInstance 崩溃：
 
-- Agent 有限次数自动重启
-- 超过阈值后任务进入 FAILED
-- 采集恢复依赖 Checkpoint
-- 上传恢复依赖 LocalBuffer
+- Agent 有限次数自动重启。
+- 超过阈值后任务进入 FAILED。
+- 采集恢复依赖 Checkpoint。
+- 上传恢复依赖 LocalBuffer。
 
 Agent 重启：
 
-- 以本地持久化状态为准恢复
-- 将 UPLOADING 批次回退为待上传
-- 恢复任务和实例状态
-- 向 Gateway 上报恢复结果
+- 以本地持久化状态为准恢复 LocalBuffer。
+- 将 UPLOADING 批次回退为待上传。
+- 基于已确认期望状态恢复任务和实例。
+- 如果 Gateway 不可用，恢复后的任务标记为 DEGRADED。
+- Gateway 恢复后进行状态对账。
 
 本地缓冲损坏：
 
-- Agent 标记 DEGRADED 或 FAILED
-- 受影响任务暂停
-- 上报告警
-- 不自动推进 Checkpoint
-- 需要人工介入
+- Agent 标记 DEGRADED 或 FAILED。
+- 受影响任务暂停。
+- 上报告警。
+- 不自动推进 Checkpoint。
+- 需要人工介入。
 
-## 15. 监控、日志与告警
+## 18. Gateway 限流与多租户资源隔离
+
+Customer 是权限和资源隔离的一级边界。第一版必须至少具备以下逻辑限流点：
+
+- 按 customerId 限流。
+- 按 agentId 限流。
+- 按 taskId 限流。
+- 上传批次大小限制。
+- 单请求记录数限制。
+- 单记录大小限制。
+- Gateway ingest 队列长度限制。
+- RETRYABLE_FAILURE 与过载错误码。
+- Agent 接收过载错误后的退避策略。
+
+限流目标不是丢弃数据，而是保护 Gateway、数据存储和其他租户。限流导致的上传失败应通过 RETRYABLE_FAILURE 和 Agent 本地缓冲吸收。
+
+第一版 Gateway 配额以不超过 `10` 个高密度工业采集 Agent 为基线，具体数值见容量与性能章节。
+
+## 19. 容量、性能与削峰填谷设计
+
+第一版容量基线面向工业过程点高频采集场景，采用“少量高密度 Agent”而不是“大量低密度 Agent”的设计口径。
+
+系统级基线：
+
+| 指标 | v1 基线 |
+|------|---------|
+| 高密度 Agent 数量 | `<= 10` |
+| 单 Agent 过程点数量 | `10000 Point` |
+| 单 Agent 设计上限 | `30000 Point`，需压测验证 |
+| 最小采集周期 | `1s` |
+| 单 Agent 日常平均写入速率 | `4000 samples/s` |
+| 单 Agent 峰值写入速率 | `10000 samples/s` |
+| Gateway 平均接入吞吐 | `40000 samples/s` |
+| Gateway 峰值接入吞吐 | `100000 samples/s` |
+| Gateway 设计余量 | `150000 samples/s` |
+| Gateway Ingest 实例数 | `2 - 3` |
+| 单 Ingest 实例目标吞吐 | `50000 samples/s` |
+
+Agent 本地读写性能：
+
+| 指标 | 目标 |
+|------|------|
+| 本地写入目标 | `10000` 条 `< 100ms` |
+| 本地读取目标 | `10000` 条 `< 100ms` |
+| 架构验收底线 | `10000` 条读 / 写 p95 `< 150ms` |
+| 默认缓存保留期 | `30 天` |
+| 容量规划保留期 | `35 天` |
+
+本地容量规划采用“平均负载保留 + 峰值吞吐承载”：
+
+| 场景 | 速率 | payload 日增量 | 30 天 payload | 建议可用磁盘 |
+|------|------|----------------|---------------|--------------|
+| 日常平均 | `4000 samples/s` | `约 17.28GB/day` | `约 518GB` | `>= 1TB SSD/NVMe` |
+| 峰值长期持续 | `10000 samples/s` | `约 43.2GB/day` | `约 1.296TB` | `>= 2.5TB SSD/NVMe` |
+| 高保障部署 | `10000 samples/s` 长期 + 额外余量 | - | - | `2.5TB - 4TB SSD/NVMe` |
+
+上述估算以平均 payload `50B` 为参考。实际容量还必须计入记录头、Block 头、WAL 冗余窗口、Segment 尾元数据、Cursor、Checkpoint 和文件系统开销。
+
+削峰填谷策略：
+
+```text
+采集写入链路优先接住现场数据。
+上传回放链路根据 Agent 本地积压、Gateway 反馈和资源水位平滑上传。
+```
+
+`UploadRateController` 输入包括：
+
+- 当前实时采集速率 `ingestRate`。
+- 当前上传成功速率 `uploadSuccessRate`。
+- LocalBuffer 水位。
+- `oldestUnackedAge`。
+- Gateway ACK 延迟。
+- Gateway RETRYABLE_FAILURE / OVERLOADED 信号。
+- Agent 本地 CPU、磁盘 IO、网络使用率。
+- customer、agent、task 级上传配额。
+
+`UploadRateController` 输出包括：
+
+- 当前上传 worker 数。
+- ReplayBatch 大小。
+- 每秒最大上传 samples / bytes。
+- 重试退避时间。
+- 是否进入 catch-up 模式。
+
+建议调速参数：
+
+| 场景 | 建议值 |
+|------|--------|
+| 正常上传速率 | `1.1x - 1.5x` 当前采集速率 |
+| catch-up 初始速率 | `2x` 当前采集速率 |
+| catch-up 最大速率 | `3x - 5x` 当前采集速率，受 Gateway 配额限制 |
+| 单 Agent 上传 worker | 默认 `2`，最大 `4` |
+| Gateway 单 Agent 峰值配额 | `15000 - 30000 samples/s` |
+| Gateway 过载降速 | 每次降为当前速率的 `50% - 70%` |
+| 恢复探测速率增长 | 每 `30s - 60s` 增加一次，直到配额上限或再次过载 |
+
+削峰填谷不以丢弃数据为手段。Gateway 短时过载时，Agent 应降低上传速率、延长补传时间，并通过 `oldestUnackedAge`、`bufferUsage` 和 `catchUpEta` 告警表达恢复进度。
+
+`catchUpEta` 计算方式：
+
+```text
+catchUpEta = backlogRecords / max(uploadRate - ingestRate, epsilon)
+```
+
+当 `catchUpEta` 超过运维阈值时必须告警。阈值建议分为 `6h` 和 `24h` 两档。
+
+## 20. 监控、日志与告警
 
 监控对象包括：
 
@@ -316,139 +778,238 @@ Agent 重启：
 - CollectorTask
 - ConnectorInstance
 - LocalBuffer
-- Gateway
+- Gateway Control Plane
+- Gateway Ingest Plane
+- GatewayMetadataStore
+- IdempotencyStore
 - 数据存储
+
+核心 SLI：
+
+- 数据上传成功率。
+- 端到端采集延迟。
+- LocalBuffer 最老未 ACK 年龄。
+- 任务运行可用率。
+- Gateway ACK 延迟。
+- Agent 心跳新鲜度。
+- 任务 Checkpoint 停滞时长。
+- Gateway ingest 错误率。
+- catch-up 预计追平时间。
 
 Agent 上报指标：
 
-- 在线状态
-- Agent 版本
-- CPU、内存、磁盘
-- LocalBuffer 水位
-- 未 ACK 批次数
-- 最老未 ACK 数据年龄
-- 上传成功率和失败次数
-- 最近成功上传时间
-- ConnectorInstance 数量
-- 任务状态摘要
+- 在线状态。
+- Agent 版本。
+- CPU、内存、磁盘。
+- LocalBuffer 水位。
+- LocalBuffer segment 数量、WAL 大小、cursor 状态。
+- 未 ACK 批次数。
+- 最老未 ACK 数据年龄。
+- backlogRecords。
+- catchUpEta。
+- 当前上传限速值和上传 worker 数。
+- 上传成功率和失败次数。
+- 最近成功上传时间。
+- ConnectorInstance 数量。
+- 任务状态摘要。
+- observedAssignmentVersion、observedTaskConfigVersion、observedPackageVersion。
 
 Task 监控指标：
 
-- 期望状态
-- 实际状态
-- 所属 Customer 和 Agent
-- Connector 类型和版本
-- 最近采集时间
-- 最近写入 LocalBuffer 时间
-- 最近 Gateway ACK 时间
-- 当前 Checkpoint
-- 未 ACK 数据量
-- 最近错误码
+- 期望状态。
+- 任务运行状态。
+- 实例状态。
+- 背压状态。
+- 所属 Customer 和 Agent。
+- Connector 类型和版本。
+- 最近采集时间。
+- 最近写入 LocalBuffer 时间。
+- 最近 Gateway ACK 时间。
+- 当前 Checkpoint。
+- Checkpoint 停滞时长。
+- 未 ACK 数据量。
+- 最近错误码。
 
 日志分为：
 
-- 运行日志
-- 审计日志
-- 数据接入日志
+- 运行日志。
+- 审计日志。
+- 数据接入日志。
+- 安全日志。
 
-第一版默认上传日志摘要和关键错误，详细日志按需由 Gateway 拉取。
+所有链路日志建议携带：
+
+- `requestId`
+- `batchId`
+- `messageId`
+- `taskId`
+- `agentId`
+- `customerId`
+- `connectorInstanceId`
+
+第一版默认上传日志摘要和关键错误。详细日志不假定 Gateway 能主动连入客户现场 Agent；应采用“Gateway 下发日志采集请求，Agent 主动上传指定时间范围、任务、实例的日志片段”的方式。
 
 告警至少包括：
 
-- Agent 离线
-- Agent DEGRADED
-- LocalBuffer HIGH/CRITICAL/FULL
-- 最老未 ACK 数据超阈值
-- 任务连续失败
-- Connector 连续重启
-- Gateway 数据接入失败率过高
-- 程序包下发失败
-- Agent 注册待审批超时
+- Agent 离线。
+- Agent DEGRADED。
+- LocalBuffer HIGH / CRITICAL / FULL。
+- 最老未 ACK 数据超阈值。
+- Checkpoint 长时间不推进。
+- catchUpEta 超过 6h / 24h 阈值。
+- LocalBuffer 游标损坏、WAL 修复、Segment 尾部修复。
+- 任务连续失败。
+- Connector 连续重启。
+- Gateway 数据接入失败率过高。
+- Gateway ACK 延迟过高。
+- 程序包下发失败。
+- Agent 注册待审批超时。
 
-## 16. 安全与权限
+## 21. 安全与权限
 
 Customer 是权限和数据隔离一级边界。所有核心对象必须带 customerId。
 
 Agent 注册策略：
 
 ```text
-按客户白名单自动纳管，其余需要审批
+按客户白名单自动纳管，其余需要审批。
 ```
+
+Agent 注册凭证分为：
+
+- `Bootstrap Token`：仅用于首次注册或绑定客户，应短期有效或一次性使用。
+- `Agent Credential`：注册审批成功后颁发，用于后续心跳、拉取任务和上传数据，必须支持轮换、吊销和过期。
 
 安全规则：
 
-- Agent 不能只靠自报 customerId 注册
-- Agent 必须携带注册凭证或预置令牌
-- Agent 与 Gateway 全链路加密通信
-- 数据上传时 Gateway 校验 Customer、Agent、Task 归属关系
-- 被禁用 Agent 的控制请求和数据上传请求都应被拒绝
+- Agent 不能只靠自报 customerId 注册。
+- Agent 必须携带注册凭证或预置令牌完成 bootstrap。
+- Agent 与 Gateway 通信必须使用 TLS。
+- 生产环境建议使用 mTLS 或等效双向认证机制。
+- 数据上传时 Gateway 校验 Customer、Agent、Task 和 assignmentVersion 归属关系。
+- 被禁用 Agent 的控制请求和数据上传请求都应被拒绝。
+- Gateway 应保存 Agent 公钥、证书指纹或等价身份标识。
 
 ConnectorPackage 安全：
 
-- 程序包由 Gateway 统一管理
-- 程序包必须有版本号
-- 程序包必须校验哈希
-- 建议支持签名校验
-- Agent 不允许运行未知程序包
+- 程序包由 Gateway 统一管理。
+- 程序包必须有版本号。
+- 程序包必须校验哈希。
+- 生产环境必须支持签名校验。
+- Agent 默认不运行签名无效、哈希不匹配或来源未知的程序包。
+
+敏感配置管理：
+
+- 任务敏感配置在中心侧必须加密存储。
+- Agent 拉取后应本地加密落盘，或在可行时尽量不落盘。
+- Connector 只能获取自身任务所需的最小密钥。
+- 密钥需要支持轮换。
+- 日志中必须脱敏。
+- Connector 不直接持有 Gateway 凭证。
 
 Connector 运行隔离：
 
-- 每个任务独立运行目录
-- 每个实例只能访问自身任务配置
-- Connector 不直接持有 Gateway 凭证
-- Connector 不直接访问其他任务数据
+- 第一版最低要求为进程级隔离、独立工作目录和最小权限文件访问。
+- 每个实例只能访问自身任务配置。
+- Connector 不直接访问其他任务数据。
+- Connector stdout / stderr 日志大小必须受限。
+- 单任务 CPU、内存、临时磁盘和连接数应可配置限制。
+- 如果部署环境允许，可以进一步采用容器级隔离。
 
 管理端权限至少包括：
 
-- 系统管理员
-- 客户管理员
-- 运维人员
-- 审计/只读角色
+- 系统管理员。
+- 客户管理员。
+- 运维人员。
+- 审计 / 只读角色。
 
-高风险操作必须记录审计。
+高风险操作必须记录审计，至少包括：
 
-## 17. 程序包与版本管理
+- Agent 注册、审批、禁用。
+- Task 创建、修改、启停。
+- Package 上传、启用、回滚。
+- 权限变更。
+- 强制迁移或人工干预。
+
+## 22. 程序包与版本管理
 
 核心对象：
 
 - `ConnectorType`
-- `ConnectorPackage`
-- `PackageVersion`
+- `ConnectorPackageVersion`
 - `TaskConfigVersion`
+- `AgentVersion`
+- `ProtocolVersion`
 
 规则：
 
-- CollectorTask 显式绑定 ConnectorType 和 ConnectorPackage 版本
-- Agent 按任务需要主动拉取程序包
-- Agent 下载后校验哈希或签名
-- Agent 本地维护包仓库
-- 同一程序包可启动多个实例
-- 程序包版本与任务配置版本分离
+- CollectorTask 显式绑定 ConnectorType 和 ConnectorPackageVersion。
+- Agent 按任务需要主动拉取程序包。
+- Agent 下载后校验哈希和签名。
+- Agent 本地维护包仓库。
+- 同一程序包可启动多个实例。
+- 程序包版本与任务配置版本分离。
+- Agent 状态上报必须携带实际运行的 observedPackageVersion 和 observedTaskConfigVersion。
 
 升级策略：
 
-- 第一版采用任务级升级
-- Gateway 修改任务期望程序包版本
-- Agent 停止旧实例并启动新实例
-- 未 ACK 数据和 Checkpoint 不受升级影响
-- 回滚必须由 Gateway 显式发起
-- 第一版灰度建议按 CollectorTask 手动灰度
+- 第一版采用任务级升级。
+- Gateway 修改任务期望程序包版本并提升 desiredStateVersion。
+- Agent 使用 `DRAINING` 或停止策略安全结束旧实例。
+- Agent 启动新版本实例。
+- 未 ACK 数据和 Checkpoint 不受升级影响。
+- 新版本启动失败时，任务进入 FAILED 或由 Gateway 显式发起回滚。
+- 回滚必须由 Gateway 显式发起。
+- 第一版灰度按 CollectorTask 手动灰度，不实现自动灰度。
 
-## 18. 动态分发预留
+ConnectorInstance 停止规则：
+
+- 优先发送优雅停止信号。
+- 给 ConnectorInstance 留出可配置宽限期。
+- 宽限期结束后仍未停止时，Agent 可强制终止并告警。
+- 停止不等于清理未 ACK 数据，LocalBuffer 清理仍按 ACK 和 Checkpoint 规则执行。
+
+## 23. 协议与版本兼容
+
+第一版必须为以下协议定义版本字段：
+
+- Agent-Gateway 控制协议版本。
+- Agent-Gateway 数据上传协议版本。
+- Connector-Agent 本地提交协议版本。
+- 数据 Envelope schemaVersion。
+- Connector SDK 最低兼容版本。
+
+兼容原则：
+
+- Gateway 应声明最低兼容 Agent 版本。
+- Agent 应声明自身支持的控制协议、数据协议和本地提交协议版本。
+- 协议不兼容时，Gateway 或 Agent 必须返回明确错误，不得静默降级。
+- 可重试的不兼容只限于短期滚动升级窗口内的临时状态。
+- 不兼容导致的数据语义风险必须按 FINAL_FAILURE 处理。
+
+具体采用 gRPC、REST、WebSocket 或其他传输方式属于实现决策。逻辑架构只要求协议具备认证、版本协商、明确错误分类、重试语义和可观测性字段。
+
+## 24. 动态分发预留
 
 第一版不实现自动动态分发。
 
 不做：
 
-- 自动任务迁移
-- 多 Agent 同时执行同一任务
-- 任务拆分并行采集
-- 实时负载均衡
+- 自动任务迁移。
+- 多 Agent 同时执行同一任务。
+- 任务拆分并行采集。
+- 实时负载均衡。
 
-预留字段：
+第一版实际使用字段：
 
 - `assignedAgentId`
 - `assignmentVersion`
+- `desiredStateVersion`
+- `TaskConfigVersion`
+- `ConnectorPackageVersion`
+
+预留字段：
+
 - `migrationState`
 - `lastConfirmedCheckpoint`
 - `resourceRequirement`
@@ -456,94 +1017,110 @@ Connector 运行隔离：
 原则：
 
 ```text
-同一时刻，一个 CollectorTask 只能有一个有效 Owner Agent
+同一时刻，一个 CollectorTask 只能有一个有效 Owner Agent。
 ```
+
+后续迁移模式预定义为：
+
+- `Clean Migration`：旧 Agent 在线，进入 DRAINING，排空未 ACK 数据后迁移。
+- `Forced Migration`：旧 Agent 不可用，基于 lastConfirmedCheckpoint 迁移，接受重复或潜在缺口风险，并产生审计记录。
 
 后续迁移必须基于：
 
-- 最后确认 Checkpoint
-- 最新 assignmentVersion
-- 目标 Agent 支持对应 ConnectorType
-- 目标 Agent 具备对应 ConnectorPackage
-- 旧 Agent 未 ACK 数据已经处理完，或明确接受重复/人工介入
+- 最后确认 Checkpoint。
+- 最新 assignmentVersion。
+- 目标 Agent 支持对应 ConnectorType。
+- 目标 Agent 具备对应 ConnectorPackageVersion。
+- 旧 Agent 未 ACK 数据已经处理完，或明确接受重复 / 人工介入。
 
-## 19. 第一版范围
+## 25. 第一版范围
 
 第一版必须实现：
 
-- Customer 管理与白名单纳管
-- Agent 注册、审批、心跳、状态上报
-- ConnectorType 和 ConnectorPackage 管理
-- CollectorTask 创建、分配、启停
-- 1 Task : 1 ConnectorInstance
-- Agent 本地可靠缓冲
-- Gateway 数据接入与 ACK
-- 至少一次上传与幂等处理
-- 任务级 Checkpoint
-- 背压策略
-- 基础监控、日志摘要、告警
-- 程序包下发、版本校验、任务级升级
-- 安全认证、权限隔离、审计
+- Customer 元数据和隔离能力。
+- Agent 注册、审批、心跳、状态上报。
+- DataSource 基础建模、Point 建模和凭证引用。
+- ConnectorType 和 ConnectorPackageVersion 管理。
+- CollectorTask 创建、分配、启停。
+- 1 Task : 1 ConnectorInstance。
+- 1 CollectorTask 覆盖一个 DataSource 或设备组下的多个 Point。
+- assignmentVersion、desiredStateVersion、TaskConfigVersion、ConnectorPackageVersion 收敛。
+- Agent 与 ConnectorInstance 本地提交协议。
+- Agent 本地二进制流可靠缓冲。
+- Batch 上传、ACK、重试和幂等处理。
+- UploadRateController 削峰填谷。
+- Gateway 数据接入与 ACK。
+- 至少一次上传与记录级幂等。
+- 任务级 Checkpoint。
+- 背压策略。
+- 基础监控、日志摘要、告警。
+- 程序包下发、版本校验、任务级升级。
+- 安全认证、权限隔离、审计。
 
 第一版不做：
 
-- 自动动态分发
-- 严格 exactly-once
-- 批次内断点续传
-- 自动灰度升级
-- 复杂业务级去重
-- Agent 离线后的自动任务迁移
-- 本地缓冲损坏后的自动无损恢复承诺
+- 自动动态分发。
+- 严格 exactly-once。
+- 批次内断点续传。
+- 自动灰度升级。
+- 自动 Agent 自升级。
+- Point 级独立启停、独立迁移和独立 Checkpoint 管理。
+- 复杂组织权限和完整客户生命周期管理。
+- 复杂业务级去重。
+- Agent 离线后的自动任务迁移。
+- 本地缓冲损坏后的自动无损恢复承诺。
+- 灾备恢复、跨数据中心容灾和 CDN / 对等包分发。
 
-## 20. 原始需求映射
+第一版容量基线：
 
-需求 1：客户 Agent 是客户现场独立服务器，同一客户可能多个 Agent。
+- 高密度 Agent 数量 `<= 10`。
+- 单 Agent 基线 `10000 Point`。
+- 单 Agent 设计上限 `30000 Point`，必须通过压测确认。
+- 日常平均写入速率 `4000 samples/s`。
+- 峰值写入速率 `10000 samples/s`。
+- 本地读写目标 `10000` 条 `< 100ms`。
+- 本地读写验收底线 `10000` 条 p95 `< 150ms`。
+- 默认部署 `>= 1TB SSD/NVMe` 可用空间。
+- 高保障部署 `2.5TB - 4TB SSD/NVMe` 可用空间。
+- Gateway 设计余量 `150000 samples/s`。
 
-设计映射：引入 Customer，建立 Customer -> Agent 纳管关系。
+## 26. 原始需求追溯矩阵
 
-需求 2：一个 Agent 上根据配置运行多个 Connector。
+| 原始需求 | 设计章节 | 设计响应 |
+|----------|----------|----------|
+| 1. 客户 Agent 是客户现场独立服务器，同一客户可能多个 Agent | 第 2、3、5、21 节 | 引入 Customer 作为边界，Agent 归属 Customer，支持多个 Agent 并通过注册凭证纳管。 |
+| 2. 一个 Agent 上根据配置运行多个 Connector | 第 5、7、8、22 节 | Gateway 创建 CollectorTask，Agent 根据期望状态和版本收敛为 ConnectorInstance。 |
+| 3. Connector 有不同类型，不同类型是不同程序包，同一程序包可启动多个实例 | 第 3、22 节 | 使用 ConnectorType、ConnectorPackageVersion、TaskConfigVersion 建模，同一包可服务多个任务实例。 |
+| 4. Agent 负责 Connector 创建、停止、监控等管理 | 第 5、6、7、8、20 节 | Agent 管理实例生命周期、本地提交、状态上报、日志和资源限制。 |
+| 5. 采集数据进入数据存储 | 第 2、9、10、11、13、14、19 节 | 数据链路为 ConnectorInstance -> Agent LocalBuffer -> Gateway Ingest -> 数据存储，并定义 Envelope、Batch、ACK、幂等和容量吞吐基线。 |
+| 6. 数据网关负责控制、程序包下发、监控、启停通知 | 第 4、8、20、22 节 | Gateway 控制面负责注册发现、任务编排、程序包管理、启停控制、监控告警和审计。 |
+| 7. 异常情况下保证稳定性，最大可能保证数据不丢 | 第 9、12、13、14、15、16、17、19 节 | 至少一次语义、本地可靠缓冲、未 ACK 重传、幂等写入、ACK 后推进 Checkpoint、背压、网络分区恢复和削峰填谷。 |
+| 8. 根据负载动态分发，注意数据完整性 | 第 8、24 节 | 第一版不自动动态分发，但实际使用 assignmentVersion，并预留 migrationState、lastConfirmedCheckpoint 和迁移模式。 |
 
-设计映射：Gateway 创建 CollectorTask，Agent 将任务落地为 ConnectorInstance。
-
-需求 3：Connector 有不同类型，不同类型是不同程序包，同一程序包可启动多个实例。
-
-设计映射：使用 ConnectorType 和 ConnectorPackage 建模，本地包仓库支持包复用。
-
-需求 4：Agent 负责 Connector 创建、停止、监控等管理。
-
-设计映射：Gateway 下发期望状态，Agent 管理实例生命周期并上报状态。
-
-需求 5：采集数据进入数据存储。
-
-设计映射：数据链路为 ConnectorInstance -> Agent LocalBuffer -> Gateway -> 数据存储。
-
-需求 6：数据网关负责控制、程序包下发、监控、启停通知。
-
-设计映射：Gateway 控制面负责注册发现、任务编排、程序包管理、启停控制和监控告警。
-
-需求 7：异常情况下保证稳定性，最大可能保证数据不丢。
-
-设计映射：至少一次语义、本地可靠缓冲、未 ACK 重传、Gateway 幂等、ACK 后推进 Checkpoint、背压保护。
-
-需求 8：根据负载动态分发，注意数据完整性。
-
-设计映射：第一版不自动动态分发，预留 assignedAgentId、assignmentVersion、负载指标和迁移状态。
-
-## 21. 风险与边界
+## 27. 风险与边界
 
 需要在设计中明确以下边界：
 
-- 至少一次语义允许重复，不保证严格只写一次
-- 业务级去重不由第一版统一保证
-- Agent 本地磁盘损坏可能导致未上传数据丢失
-- Gateway 是中心关键节点，后续需要补充高可用设计
-- 流式 Connector 的恢复能力依赖源端是否支持 offset 或重放
-- 嵌入式本地存储引擎会增加 Agent 资源和运维负担
-- 第一版不支持自动动态分发和自动任务迁移
-- 性能基线尚未定义，需要后续补充 Agent 数量、任务数量、吞吐、延迟和缓冲容量目标
+- 至少一次语义允许重复，不保证严格只写一次。
+- 业务级去重不由第一版统一保证。
+- Agent 本地磁盘损坏可能导致未上传数据丢失。
+- Gateway 是中心关键节点，第一版必须按无状态服务和外部状态存储设计，但完整灾备不是第一版范围。
+- 流式 Connector 的恢复能力依赖源端是否支持 offset、重放和足够保留期。
+- 二进制流本地缓存会降低主路径写放大，但要求提供完整巡检、修复和 benchmark 工具。
+- 第一版不支持自动动态分发和自动任务迁移。
+- 第一版容量基线仅覆盖 `<= 10` 个高密度工业 Agent；超过该规模需要重新评估 Gateway 数据面和中心数据存储。
+- 不能把每个 Point 建模为独立 CollectorTask，否则控制面和元数据规模会失控。
+- 不能把每条样本按完整 JSON Envelope 写入本地缓存，否则 30 天缓存容量和写入性能目标难以成立。
+- 如果底层数据存储无法支持幂等写入原子性，必须在详细设计中给出等价一致性方案，否则“不丢”目标不成立。
 
-## 22. 总结
+## 28. 总结
 
-第一版逻辑架构可以概括为：
+本系统以 Customer 作为租户与权限边界，以 CollectorTask 作为采集控制单元，以 Agent 作为客户现场自治执行与可靠缓冲节点，以 Gateway 作为中心控制面和数据接入面。
 
-以 Customer 为租户边界，以 Gateway 为中心控制与数据接入入口，以 Agent 为客户现场执行与可靠缓冲节点，以 CollectorTask 为最小控制单元，以 ConnectorInstance 为实际采集进程，通过本地可靠缓冲、批次 ACK、任务级 Checkpoint、Gateway 幂等写入和背压控制，实现至少一次的数据采集与中心化管理。
+Gateway 维护任务期望状态、分配关系、程序包版本、元数据和幂等状态；Agent 基于期望状态管理 ConnectorInstance，并通过本地可靠缓冲实现断网、重启和 Gateway 短暂不可用场景下的数据保护。
+
+数据链路采用至少一次语义。ConnectorInstance 采集结果必须先被 Agent 持久化到 LocalBuffer，Agent 再按批次上传 Gateway。Gateway 在完成数据持久化和幂等记录后返回 ACK。Agent 只有在收到 SUCCESS ACK 且满足顺序推进条件后，才能推进任务级 Checkpoint 并清理本地缓冲。
+
+第一版不实现自动动态分发、严格 exactly-once、批次内断点续传、自动任务迁移和自动 Agent 自升级，但从对象模型、assignmentVersion、Checkpoint、状态上报协议和迁移模式上为后续演进预留空间。
+
+容量上，第一版按 `10` 个以内高密度工业采集 Agent 设计。单 Agent 基线为 `10000` 个过程点、最小 `1s` 采集周期、日常平均 `4000 samples/s`、峰值 `10000 samples/s`，本地缓存采用二进制流 Segment + WAL + ReplayCursor，并通过 UploadRateController 在 Gateway 过载、网络恢复和积压补传场景下进行削峰填谷。
