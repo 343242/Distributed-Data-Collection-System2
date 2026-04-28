@@ -9,6 +9,7 @@
 | v0.3 | 2026-04-29 | 补充工业过程点高频采集容量基线、本地二进制流缓存模型、Gateway 接入吞吐目标和 Agent 上传削峰填谷策略。 |
 | v0.4 | 2026-04-29 | 根据 v0.3 评审补强幂等索引可行性、writeSeq/messageId 关系、全局 catch-up 协调、元数据一致性、监控聚合和运维边界。 |
 | v0.5 | 2026-04-29 | 冻结数据写入、幂等记录、ACK、Checkpoint 的一致性方案，明确 batch 级 checkpointCandidate 契约，并将真实 payload 校准列为数据面详细设计门禁。 |
+| v0.6 | 2026-04-29 | 根据 v0.5 Web 评审补齐架构图索引、接口契约、状态机转移、数据产品边界、备份恢复、时间语义、ConnectorType 能力、运维处置、验收矩阵和部署前提。 |
 
 ## 1. 设计目标
 
@@ -48,6 +49,14 @@
 监控链路：Agent -> Gateway Control Plane
 日志链路：Gateway 下发采集请求 -> Agent 主动上传日志片段
 ```
+
+v0.6 补充三张架构评审视图，用于帮助后续详细设计、开发拆分、测试验收和运维交接统一理解：
+
+- 部署拓扑图：![分布式数据采集系统部署拓扑图](assets/logical-architecture/deployment-topology-v1.png)
+- 逻辑组件图：![分布式数据采集系统逻辑组件图](assets/logical-architecture/logical-components-v1.png)
+- 核心写入时序图：![核心数据写入时序图](assets/logical-architecture/core-write-sequence-v1.png)
+
+上述图片是逻辑架构视图，不替代详细设计中的 API schema、部署清单、DDL、文件格式和运维 SOP。若图片与正文文字冲突，以正文约束为准；图片需要随正文版本同步更新。
 
 第一版中，`Gateway Control Plane` 与 `Gateway Ingest Plane` 可以物理同进程部署，但逻辑上必须隔离：
 
@@ -291,6 +300,42 @@ Agent -> ConnectorInstance: append accepted / rejected
 ```
 
 因此，`assignmentVersion` 和 `desiredStateVersion` 不是仅为未来动态分发预留，第一版启停控制也必须使用。
+
+状态机转移规则：
+
+| 状态机 | 当前状态 | 目标状态 | 是否允许 | 触发方 / 说明 |
+|--------|----------|----------|----------|---------------|
+| DesiredState | DISABLED | ENABLED | 允许 | Gateway 控制面启动任务，提升 desiredStateVersion |
+| DesiredState | ENABLED | DRAINING | 允许 | Gateway 控制面停止新采集但继续上传未 ACK 数据 |
+| DesiredState | DRAINING | DISABLED | 允许 | 未 ACK 数据排空或人工确认风险后停用 |
+| DesiredState | ENABLED | DISABLED | 允许但不推荐直接跳转 | 语义上应等价于要求 Agent 进入 DRAINING 后再停用；除紧急禁用外不应跳过排空 |
+| DesiredState | DRAINING | ENABLED | 允许 | 取消停用，恢复采集 |
+| TaskRuntimeState | UNASSIGNED | ASSIGNED | 允许 | Gateway 完成任务分配 |
+| TaskRuntimeState | ASSIGNED | DEPLOYING | 允许 | Agent 已观察到最新 assignmentVersion 并开始部署 |
+| TaskRuntimeState | DEPLOYING | RUNNING | 允许 | ConnectorInstance 启动成功 |
+| TaskRuntimeState | RUNNING | DRAINING | 允许 | Agent 执行 DRAINING 期望状态 |
+| TaskRuntimeState | DRAINING | STOPPED | 允许 | 采集停止且未 ACK 数据满足停用条件 |
+| TaskRuntimeState | DEPLOYING / RUNNING | FAILED | 允许 | 启动失败、运行失败、协议错误或资源不可用 |
+| TaskRuntimeState | FAILED | DEPLOYING / STOPPED | 允许但必须由 Gateway 指令或人工介入触发 | 禁止 Agent 静默无限自恢复 |
+| InstanceState | CREATED | STARTING | 允许 | Agent 创建实例并启动进程 |
+| InstanceState | STARTING | RUNNING | 允许 | ConnectorInstance 就绪 |
+| InstanceState | RUNNING | THROTTLED / PAUSED | 允许 | 背压或运维指令触发 |
+| InstanceState | RUNNING | STOPPING | 允许 | DRAINING、DISABLED、升级或人工停止 |
+| InstanceState | STOPPING | EXITED | 允许 | 优雅退出或强制终止完成 |
+| InstanceState | RUNNING | CRASHED | 允许 | Connector 进程异常退出 |
+| InstanceState | CRASHED | STARTING | 允许但受自动重启次数限制 | 超过阈值后任务进入 FAILED |
+| BatchState | PENDING | UPLOADING | 允许 | Agent UploadManager 发起上传 |
+| BatchState | UPLOADING | ACKED | 允许 | Gateway 返回 SUCCESS |
+| BatchState | UPLOADING | RETRY_WAIT | 允许 | 超时、无响应或 RETRYABLE_FAILURE |
+| BatchState | RETRY_WAIT | UPLOADING | 允许 | 退避期结束后重传 |
+| BatchState | UPLOADING | FINAL_FAILED | 允许 | Gateway 返回 FINAL_FAILURE |
+
+状态写入边界：
+
+- DesiredState、assignmentVersion、desiredStateVersion、TaskConfigVersion 和 ConnectorPackageVersion 由 Gateway 控制面写入。
+- TaskRuntimeState、InstanceState、BatchState 和 BackpressureState 的现场事实由 Agent 产生并上报。
+- Gateway 可根据 Agent 上报推导观测态，但不得用推导态覆盖 Agent 本地可恢复状态。
+- 高风险状态转移必须记录审计，包括任务启停、DRAINING、DISABLED、FAILED 人工恢复、Agent 禁用、程序包回滚和强制迁移。
 
 ## 9. 数据可靠性设计
 
@@ -1192,6 +1237,26 @@ ConnectorInstance 停止规则：
 
 具体采用 gRPC、REST、WebSocket 或其他传输方式属于实现决策。逻辑架构只要求协议具备认证、版本协商、明确错误分类、重试语义和可观测性字段。
 
+逻辑接口契约清单：
+
+| 接口 | 调用方 | 被调用方 | 幂等性 | 可重试 | 关键版本 / 幂等字段 | 主要错误类型 |
+|------|--------|----------|--------|--------|----------------------|--------------|
+| Agent 注册 | Agent | Gateway Control Plane | 是 | 是 | AgentVersion、ProtocolVersion、machineFingerprint | 未授权、待审批、重复注册、凭证失效 |
+| Agent 心跳 | Agent | Gateway Control Plane | 是 | 是 | observedAssignmentVersion、observedDesiredStateVersion、observedTaskConfigVersion、observedPackageVersion | Agent 禁用、凭证失效、协议不兼容 |
+| 状态拉取 / 下发 | Agent / Gateway | Gateway / Agent | 是 | 是 | assignmentVersion、desiredStateVersion、TaskConfigVersion、ConnectorPackageVersion | 版本过旧、任务不归属、配置不可用 |
+| 包下载 | Agent | Gateway / Package Repository | 是 | 是 | ConnectorPackageVersion、hash、signature | 版本不存在、哈希失败、签名失败、权限错误 |
+| 本地 append | ConnectorInstance | Agent LocalIngestServer | 否，依赖 LocalBuffer 接收语义 | Connector 侧可重试 | local submit protocol version、schemaVersion、connectorInstanceId、batch checkpointCandidate | 协议错误、任务不匹配、缓冲不可用、Checkpoint 候选值非法 |
+| Batch 上传 | Agent UploadManager | Gateway Ingest Plane | 是 | 是 | batchId、assignmentVersion、schemaVersion、messageId / writeSeq range、payloadDigest | SUCCESS、RETRYABLE_FAILURE、FINAL_FAILURE、OVERLOADED |
+| 日志片段上传 | Agent LogManager | Gateway Control Plane | 是 | 是 | requestId、agentId、taskId、timeRange | 日志不存在、权限错误、上传失败、请求过期 |
+
+接口通用规则：
+
+- 所有跨网络接口必须携带 customerId 或可由认证上下文唯一推导 customerId。
+- 所有可重试接口必须定义超时语义；超时不得被调用方解释为“服务端一定没有处理”。
+- 所有控制类写接口必须记录审计日志。
+- 所有数据面接口必须携带 requestId 或 batchId，便于日志、指标和追踪关联。
+- 详细 API schema、字段类型、错误码枚举和传输协议属于详细设计产物，不在逻辑架构中展开。
+
 ## 24. 动态分发预留
 
 第一版不实现自动动态分发。
@@ -1303,7 +1368,219 @@ ConnectorInstance 停止规则：
 - 已形成数据写入、幂等、ACK、Checkpoint 的失败矩阵和恢复策略。
 - 已按首批目标 ConnectorType 的真实 payload、批大小和放大系数重新校准容量基线。
 
-## 26. 原始需求追溯矩阵
+## 26. v0.6 评审闭环补充
+
+本节补充 v0.5 Web 评审中提出的闭环材料。原则是：补充逻辑架构必须冻结的契约、边界和门禁，不展开详细设计层面的 API schema、DDL、二进制格式、命令参数和部署脚本。
+
+### 26.1 中心数据存储与下游消费边界
+
+Gateway Ingest 成功写入数据存储，只代表采集数据已经进入中心侧持久化边界，不代表业务系统已经完成消费、清洗、质量校验或业务级去重。
+
+中心采集数据至少应具备以下逻辑字段或等价表达：
+
+- `customerId`
+- `agentId`
+- `taskId`
+- `connectorType`
+- `schemaVersion`
+- `messageId`
+- `eventTime`
+- `agentIngestTime`
+- `gatewayIngestTime`
+- `payload`
+- `qualityCode` 或等价质量字段
+
+中心数据存储边界规则：
+
+- 数据必须按 customerId 做逻辑隔离；管理 API 和业务查询 API 均不得绕过 customerId 授权过滤。
+- 数据唯一性或幂等约束应以 `customerId + taskId + agentId + storageStreamId + writeSeq` 或等价键表达。
+- `schemaVersion` 是下游消费兼容的基础字段；同一 schemaVersion 不得改变不兼容语义。
+- 至少一次语义下，重复数据不应被静默扩散给下游；如果物理存储允许重复写入，下游读取层必须能按幂等键或等价视图过滤。
+- 迟到数据和乱序数据必须保留原始 eventTime、agentIngestTime 和 gatewayIngestTime，不能通过覆盖时间字段掩盖乱序。
+- 数据修复、补传、回放后，下游应能通过 messageId、batchId、requestId 或等价审计字段追踪来源。
+- 第一版不定义清洗后数据模型；业务系统默认读取中心采集数据或其只读视图，清洗、质量评分和业务级聚合属于业务系统或后续数据产品设计。
+
+### 26.2 备份、恢复与灾备边界
+
+第一版不承诺跨数据中心强一致灾备，但必须具备同一部署单元内的备份恢复边界。
+
+备份恢复对象：
+
+- `GatewayMetadataStore`：Customer、Agent、DataSource、CollectorTask、版本、分配关系、审计和包注册表。
+- `IdempotencyStore` 或等价区间 manifest：幂等键、writeSeq 区间、payloadDigest、checkpointCandidateDigest 和提交状态。
+- 数据存储：中心侧采集数据。
+- `Package Repository`：ConnectorPackageVersion、hash、signature、发布状态和包文件。
+
+恢复规则：
+
+- GatewayMetadataStore 恢复后必须重新校验 Agent 上报的 observed version，不得假定中心恢复点一定比 Agent 本地状态新。
+- 数据存储与幂等状态恢复后不得出现“幂等已成功但数据缺失”的状态；如果无法证明一致，应保守允许 Agent 重传并依赖唯一约束 / 区间 manifest 收敛。
+- Package Repository 恢复后必须重新校验包 hash 和 signature；不能因恢复流程跳过包可信校验。
+- 误禁用 Agent、误停任务、误发布或误回滚程序包必须通过审计记录定位，并由 Gateway 显式发起恢复动作。
+- 误删任务如果涉及未 ACK 数据、Checkpoint 或幂等状态，不得仅通过重新创建同名任务恢复；必须保留或恢复原 taskId 关联的状态，或明确接受重复 / 缺口风险并记录审计。
+- 单 Region 故障时，第一版默认进入停服或人工恢复模式；如果要求自动切换 Region，需要单独设计 RPO/RTO、数据复制、幂等状态复制和 Agent 重新接入策略。
+
+备份恢复演练应纳入 v1 验收门禁，但具体备份周期、保留期、介质和恢复脚本属于部署与运维详细设计。
+
+### 26.3 时间语义、乱序与时钟漂移
+
+系统使用三类时间：
+
+- `eventTime`：源端业务采集时间，由 ConnectorType 根据源端语义产生。
+- `agentIngestTime`：Agent 接收并写入 LocalBuffer 前后的本地时间。
+- `gatewayIngestTime`：Gateway Ingest 接收或提交数据时的中心侧时间。
+
+时间语义规则：
+
+- eventTime 是业务采集时间，不能单独作为系统可靠性判断依据。
+- 系统可靠性判断应以 LocalBuffer 写入、Batch ACK 和 Checkpoint 推进为准。
+- 端到端延迟 SLI 应明确使用 `gatewayIngestTime - eventTime`、`gatewayIngestTime - agentIngestTime` 或其他口径；不同口径不得混用。
+- Agent 应部署 NTP 或等效时间同步机制；时钟漂移阈值属于部署参数，但超过阈值必须告警。
+- 未来时间、极端迟到时间、乱序时间和重复时间戳不得导致数据被静默丢弃；应通过质量码、错误码或告警表达。
+- Checkpoint 是否可基于 eventTime 推进由 ConnectorType 定义；系统层不默认允许仅凭 eventTime 推进 Checkpoint。
+- 工业过程点缺测、无效值、质量码和重复时间戳必须在 payload schema 或 qualityCode 中表达，不能用空 payload 或丢弃记录代替。
+
+### 26.4 Connector SDK 与 ConnectorType 能力契约
+
+新增 ConnectorType 前，必须先提交能力声明、payload schema、Checkpoint 语义、错误码映射和容量压测基线，否则不得进入生产任务配置。
+
+ConnectorType 能力声明至少包括：
+
+- `replayable`
+- `pauseSupported`
+- `throttleSupported`
+- `resumeFromCheckpointSupported`
+- `compareCheckpoint`
+- `maxSourceRetentionHint`
+- `lossRiskWhenPaused`
+- `lossySamplingAllowed`
+- `sourceLagMetricSupported`
+
+Connector SDK 或等价本地提交适配层至少需要定义：
+
+- 生命周期回调：start、drain、stop、health。
+- 本地 append 调用语义：records、batch checkpointCandidate、schemaVersion、错误返回和重试建议。
+- payload schema 和 schemaVersion 兼容策略。
+- Checkpoint 候选值生成、归并和单调校验规则。
+- 源端 lag、采集错误、源端限流和源端凭证错误的报告方式。
+- Connector 退出码到 InstanceState / TaskRuntimeState 的映射。
+- Connector SDK 与 Agent 本地提交协议的最低兼容版本。
+
+第一版不要求所有 ConnectorType 都具备暂停、降速或无损恢复能力，但必须明确声明缺失能力和对应数据风险。
+
+### 26.5 手工运维与故障处置边界
+
+以下场景必须具备配套 runbook 或等价运维流程：
+
+- LocalBuffer HIGH / CRITICAL / FULL。
+- FINAL_FAILURE。
+- 幂等冲突。
+- Checkpoint 长时间不推进。
+- Agent 被替换后旧 Agent 恢复上线。
+- Gateway Ingest 过载。
+- 数据存储提交结果未知。
+- LocalBuffer WAL 或 Segment 尾部损坏。
+- 程序包签名校验失败。
+- Connector 连续崩溃。
+- Customer 级配额耗尽。
+
+第一版允许的人工操作：
+
+- 暂停任务。
+- 强制进入 DRAINING。
+- 禁用 Agent。
+- 回滚程序包版本。
+- 触发日志采集。
+- 触发 `cachectl verify` / `cachectl repair-tail`。
+- 在明确审计和风险确认后发起人工迁移任务。
+
+以下操作禁止或必须双人审批：
+
+- 人工推进 Checkpoint。
+- 人工删除未 ACK 数据。
+- 手动清理仍可能被 Agent 重传的幂等记录。
+- 跳过包签名校验。
+- 强制迁移未排空任务。
+- 绕过 customerId 授权直接查询或导出客户数据。
+
+### 26.6 验收标准与故障注入矩阵
+
+可靠性验收必须覆盖以下矩阵。通过标准不是“没有错误”，而是错误发生后状态能收敛、数据不静默丢失、风险可观测。
+
+| 类别 | 场景 | 期望结果 |
+|------|------|----------|
+| Agent 重启 | LocalBuffer 中存在 UPLOADING 批次 | 重启后回退为 PENDING 或 RETRY_WAIT，不丢数据 |
+| ACK 丢失 | Gateway 已提交成功但 Agent 未收到 ACK | Agent 整批重传，Gateway 基于幂等返回 SUCCESS |
+| 幂等冲突 | 同一幂等键对应不同 payload | Gateway 返回 FINAL_FAILURE 并告警 |
+| Gateway 过载 | Ingest 返回 RETRYABLE_FAILURE / OVERLOADED | Agent 降速、退避、不推进 Checkpoint |
+| 指令乱序 | Agent 先收到 DISABLED v11 后收到 ENABLED v10 | Agent 拒绝旧版本指令 |
+| LocalBuffer 损坏 | WAL 或 Segment 尾部损坏 | 保守恢复或任务 FAILED，不伪造成功 |
+| Checkpoint 崩溃窗口 | Batch ACKED 后 Agent 崩溃 | 恢复后不得出现 Checkpoint 已推进但数据被误删 |
+| 元数据并发更新 | 多 Gateway 实例同时更新任务状态 | CAS / 乐观锁防止旧版本覆盖新版本 |
+| Catch-up 风暴 | 多 Agent 同时恢复上传 | Gateway 全局配额限制，避免所有 Agent 满速补传 |
+| Agent 替换 | 旧 Agent 被替换后重新上线 | 旧凭证被拒绝或进入只读排障窗口，不得继续上传生产数据 |
+| 包校验失败 | 程序包 hash 或 signature 不匹配 | Agent 拒绝运行包并告警 |
+| 数据存储结果未知 | 提交结果不可判定 | Gateway 不返回 SUCCESS，Agent 保留未 ACK 数据并重传 |
+
+该矩阵是 v1 架构验收门禁之一。具体测试脚本、混沌注入工具和压测报告属于测试详细设计产物。
+
+### 26.7 安全供应链与合规补充
+
+安全章节已定义认证、凭证、TLS、包签名、敏感配置和审计。v0.6 进一步明确供应链与合规边界：
+
+- ConnectorPackage 应提供 SBOM 或等价依赖清单。
+- 程序包发布前应进行漏洞扫描或等价安全检查。
+- 程序包发布、启用和回滚必须经过 Gateway 控制面审批并记录审计。
+- 包签名密钥必须具备管理、轮换和吊销机制。
+- 客户现场离线部署时，包可信链必须可离线验证，不能依赖运行时访问外部服务才能验证签名。
+- Agent 本地密钥存储方式必须防止普通 Connector 进程直接读取 Gateway 凭证。
+- 系统应支持数据分类和敏感字段识别要求；具体分类规则由业务和合规策略确定。
+- 客户数据删除、租户注销和审计日志防篡改要求属于上线前合规设计门禁。
+- 管理员越权访问客户数据必须通过权限隔离、审计和最小权限控制约束。
+
+### 26.8 网络与部署前提
+
+客户现场环境前提会反向影响 LocalBuffer 容量、Agent 可用性和 Gateway 可达性，因此应在逻辑架构中声明最低前提。
+
+第一版网络前提：
+
+- Agent 默认只需要出站访问 Gateway 固定域名或负载均衡入口。
+- Gateway 不假定能主动连入客户现场 Agent。
+- 控制 / 心跳 / 监控通道与数据上传通道逻辑分离；物理上可复用域名，但必须支持独立限流、超时、错误码和监控。
+- 包下载和数据上传可以采用不同网络策略，但都必须具备认证、TLS、超时和重试语义。
+- 如客户现场要求 HTTP / SOCKS 代理，代理支持属于部署适配项，但不能改变 ACK、重试和幂等语义。
+- 客户现场 DNS、TLS 证书更新、时间同步、磁盘可用空间和文件权限必须纳入部署检查。
+- Agent 应以最小权限运行；Connector 工作目录、包目录、日志目录、LocalBuffer 目录和密钥目录应具备清晰权限边界。
+- 断网最长设计窗口必须与本地磁盘容量联动计算；超过容量规划窗口时，系统只能通过背压、扩容或人工处置降低风险，不能承诺无损。
+
+### 26.9 详细设计门禁清单
+
+进入详细设计前，必须具备：
+
+- 架构图、逻辑组件图和核心写入时序图已经随文档版本归档。
+- 逻辑接口契约清单已经覆盖注册、心跳、状态下发、包下载、本地 append、Batch 上传和日志上传。
+- 状态机转移表已经覆盖 DesiredState、TaskRuntimeState、InstanceState 和 BatchState。
+- 数据写入、幂等、ACK、Checkpoint 的失败矩阵已经冻结。
+- 数据存储与幂等提交记录的原子提交边界已被目标存储方案验证。
+- 首批目标 ConnectorType 的真实 payload、批大小和放大系数已经完成容量校准。
+- 备份恢复边界和“幂等状态不能领先于数据恢复”的约束已经明确。
+- ConnectorType 能力声明模板已经形成。
+- 故障注入与验收矩阵已经纳入 v1 验收计划。
+
+可以后置到详细设计的产物包括：
+
+- 具体存储产品选型。
+- Gateway API schema。
+- Agent 本地提交协议 schema。
+- LocalBuffer 文件格式、WAL / Segment / Cursor 二进制格式。
+- Connector SDK 接口定义。
+- Gateway 元数据表 DDL。
+- 数据存储表设计。
+- Prometheus / OpenTelemetry 指标命名。
+- `cachectl` 命令参数。
+- 压测报告、容量采购建议、运维 SOP、备份恢复演练报告和安全测试报告。
+
+## 27. 原始需求追溯矩阵
 
 | 原始需求 | 设计章节 | 设计响应 |
 |----------|----------|----------|
@@ -1316,7 +1593,7 @@ ConnectorInstance 停止规则：
 | 7. 异常情况下保证稳定性，最大可能保证数据不丢 | 第 9、12、13、14、15、16、17、19 节 | 至少一次语义、本地可靠缓冲、未 ACK 重传、幂等写入、ACK 后推进 Checkpoint、背压、网络分区恢复和削峰填谷。 |
 | 8. 根据负载动态分发，注意数据完整性 | 第 8、24 节 | 第一版不自动动态分发，但实际使用 assignmentVersion，并预留 migrationState、lastConfirmedCheckpoint 和迁移模式。 |
 
-## 27. 风险与边界
+## 28. 风险与边界
 
 需要在设计中明确以下边界：
 
@@ -1335,11 +1612,13 @@ ConnectorInstance 停止规则：
 - 多 Agent 同时 catch-up 必须由 Gateway 分配全局配额；否则恢复场景可能超过 Gateway 设计余量。
 - 如果底层数据存储无法支持数据写入与幂等提交记录的同一原子提交单元，不能直接进入第一版数据面详细设计；必须先评审可恢复写入日志或两阶段状态替代方案。
 - 如果 ConnectorType 不能提供 batch 级 checkpointCandidate 归并和单调校验规则，相关任务不能进入可恢复采集设计。
+- 如果缺少 ConnectorType 能力声明、payload schema、Checkpoint 语义和容量校准，相关 ConnectorType 不能进入生产任务配置。
+- 如果没有完成备份恢复演练或无法证明数据与幂等状态恢复一致，不能把系统宣称为满足 v1 可靠性验收。
 - 第一版不覆盖跨数据中心灾备；如要求 Gateway 数据中心级故障恢复，需要单独设计 RPO/RTO、数据复制和 Agent 重新接入策略。
 - 第一版必须补充测试方案后再进入实现验收，至少覆盖混沌网络、断电恢复、WAL 损坏、Segment 尾损坏、幂等重复写和 catch-up 过载。
 - 可观测性第一版建议兼容 Prometheus/OpenTelemetry，但具体平台集成不属于逻辑架构正文的实现承诺。
 
-## 28. 总结
+## 29. 总结
 
 本系统以 Customer 作为租户与权限边界，以 CollectorTask 作为采集控制单元，以 Agent 作为客户现场自治执行与可靠缓冲节点，以 Gateway 作为中心控制面和数据接入面。
 
@@ -1352,3 +1631,5 @@ Gateway 维护任务期望状态、分配关系、程序包版本、元数据和
 容量上，第一版按 `10` 个以内高密度工业采集 Agent 设计。单 Agent 基线为 `10000` 个过程点、最小 `1s` 采集周期、日常平均 `4000 samples/s`、峰值 `10000 samples/s`，本地缓存采用二进制流 Segment + WAL + ReplayCursor，并通过 UploadRateController 在 Gateway 过载、网络恢复和积压补传场景下进行削峰填谷。
 
 v0.5 进一步明确：第一版数据面采用数据写入与幂等提交记录同一原子提交单元，Gateway 只有在持久化成功后才能返回 SUCCESS；系统级 Checkpoint 只接受 Batch 级 checkpointCandidate，并要求 ConnectorType 提供多游标归并和单调校验规则；容量基线必须用首批目标 Connector 的真实 payload、批大小和放大系数校准后，才能转化为详细设计和验收指标。
+
+v0.6 进一步补齐评审闭环材料：将部署拓扑图、逻辑组件图和核心写入时序图纳入文档资产；明确逻辑接口契约、状态机转移、中心数据存储与下游消费边界、备份恢复、时间语义、ConnectorType 能力契约、手工运维边界、故障注入验收矩阵、安全供应链和客户现场网络部署前提。补齐后，文档更适合作为详细设计、开发拆分、测试验收和运维交接的上游依据。
