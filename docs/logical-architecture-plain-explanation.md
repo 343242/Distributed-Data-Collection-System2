@@ -1,6 +1,6 @@
 # 分布式数据采集系统为什么这样设计（大白话版）
 
-本文对应 [logical-architecture.md](/home/instant/projects/Distributed-Data-Collection-System2/docs/logical-architecture.md) **v0.6** 版本。如果正式版迭代到 v0.7 及以后，请以正式版为准；本文件中的解释可能需要同步更新。
+本文对应 [logical-architecture.md](/home/instant/projects/Distributed-Data-Collection-System2/docs/logical-architecture.md) **v0.8** 版本。如果正式版迭代到 v0.9 及以后，请以正式版为准；本文件中的解释可能需要同步更新。
 
 ```text
 这套系统为什么要这样设计，而不是更简单一点？

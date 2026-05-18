@@ -11,6 +11,7 @@
 | v0.5 | 2026-04-29 | 冻结数据写入、幂等记录、ACK、Checkpoint 的一致性方案，明确 batch 级 checkpointCandidate 契约，并将真实 payload 校准列为数据面详细设计门禁。 |
 | v0.6 | 2026-04-29 | 根据 v0.5 Web 评审补齐架构图索引、接口契约、状态机转移、数据产品边界、备份恢复、时间语义、ConnectorType 能力、运维处置、验收矩阵和部署前提。 |
 | v0.7 | 2026-05-19 | 根据 v0.6 审查补齐 storageStreamId 定义、ENABLED→DISABLED 直接跳转处置语义、observed version 精确定义和收敛判断两步机制、BatchState 终态补充、catch-up lease 基本属性、GatewayMetadataStore 读己之写选型门禁和大白话版版本对应声明。 |
+| v0.8 | 2026-05-19 | 冻结第一版存储选型决策：PostgreSQL + TimescaleDB 统一承载 GatewayMetadataStore、IdempotencyStore 和数据存储，满足数据写入与幂等提交记录同一原子提交单元的硬约束。补充选型依据、架构约束匹配分析和部署拓扑。 |
 
 ## 1. 设计目标
 
@@ -1582,19 +1583,19 @@ Connector SDK 或等价本地提交适配层至少需要定义：
 
 进入详细设计前，必须具备：
 
-- 架构图、逻辑组件图和核心写入时序图已经随文档版本归档。
-- 逻辑接口契约清单已经覆盖注册、心跳、状态下发、包下载、本地 append、Batch 上传和日志上传。
-- 状态机转移表已经覆盖 DesiredState、TaskRuntimeState、InstanceState 和 BatchState。
-- 数据写入、幂等、ACK、Checkpoint 的失败矩阵已经冻结。
-- 数据存储与幂等提交记录的原子提交边界已被目标存储方案验证。
+- ~~架构图、逻辑组件图和核心写入时序图已经随文档版本归档。~~ ✅ v0.6
+- ~~逻辑接口契约清单已经覆盖注册、心跳、状态下发、包下载、本地 append、Batch 上传和日志上传。~~ ✅ v0.6
+- ~~状态机转移表已经覆盖 DesiredState、TaskRuntimeState、InstanceState 和 BatchState。~~ ✅ v0.6/v0.7
+- ~~数据写入、幂等、ACK、Checkpoint 的失败矩阵已经冻结。~~ ✅ v0.5
+- ~~数据存储与幂等提交记录的原子提交边界已被目标存储方案验证。~~ ✅ v0.8（PostgreSQL + TimescaleDB 同实例同事务）
 - 首批目标 ConnectorType 的真实 payload、批大小和放大系数已经完成容量校准。
-- 备份恢复边界和“幂等状态不能领先于数据恢复”的约束已经明确。
-- ConnectorType 能力声明模板已经形成。
-- 故障注入与验收矩阵已经纳入 v1 验收计划。
+- ~~备份恢复边界和"幂等状态不能领先于数据恢复"的约束已经明确。~~ ✅ v0.6
+- ~~ConnectorType 能力声明模板已经形成。~~ ✅ v0.6
+- ~~故障注入与验收矩阵已经纳入 v1 验收计划。~~ ✅ v0.6
 
 可以后置到详细设计的产物包括：
 
-- 具体存储产品选型。
+- ~~具体存储产品选型。~~ ✅ v0.8 已冻结为 PostgreSQL + TimescaleDB。
 - Gateway API schema。
 - Agent 本地提交协议 schema。
 - LocalBuffer 文件格式、WAL / Segment / Cursor 二进制格式。
@@ -1658,3 +1659,162 @@ Gateway 维护任务期望状态、分配关系、程序包版本、元数据和
 v0.5 进一步明确：第一版数据面采用数据写入与幂等提交记录同一原子提交单元，Gateway 只有在持久化成功后才能返回 SUCCESS；系统级 Checkpoint 只接受 Batch 级 checkpointCandidate，并要求 ConnectorType 提供多游标归并和单调校验规则；容量基线必须用首批目标 Connector 的真实 payload、批大小和放大系数校准后，才能转化为详细设计和验收指标。
 
 v0.6 进一步补齐评审闭环材料：将部署拓扑图、逻辑组件图和核心写入时序图纳入文档资产；明确逻辑接口契约、状态机转移、中心数据存储与下游消费边界、备份恢复、时间语义、ConnectorType 能力契约、手工运维边界、故障注入验收矩阵、安全供应链和客户现场网络部署前提。补齐后，文档更适合作为详细设计、开发拆分、测试验收和运维交接的上游依据。
+
+v0.7 进一步补齐 v0.6 审查发现的精确性缺口：明确 storageStreamId 等于 taskId；定义 ENABLED→DISABLED 直接跳转的 Agent 行为为立即停采集但继续排空上传；明确 observed version 为已持久化并开始执行，Gateway 收敛判断拆为指令送达和状态收敛两步；补充 BatchState 终态 PURGED 和 ABANDONED；补充 catch-up lease TTL 和过期行为；补充 GatewayMetadataStore 读己之写选型门禁。
+
+v0.8 冻结第一版存储选型决策。选型结论和依据见第 30 节。
+
+## 30. 第一版存储选型决策
+
+### 30.1 选型背景
+
+逻辑架构 v0.5 冻结了一条硬约束：
+
+```text
+数据写入 + 幂等提交记录必须在同一原子提交单元内。
+```
+
+该约束直接决定了第一版存储选型的可行性边界：
+
+- IdempotencyStore 和数据存储必须在同一个数据库实例内，共享同一事务引擎。
+- 不能采用跨库两阶段提交或独立两阶段状态表作为默认方案（§13 已排除）。
+- 不能将数据写入和幂等记录拆到不同数据库然后依赖异步对账。
+
+第一版需要三类逻辑存储：
+
+| 逻辑存储 | 职责 | 写入特征 | 关键约束 |
+|----------|------|----------|----------|
+| GatewayMetadataStore | Customer、Agent、Task、版本、分配关系、审计、包注册表 | 关系型，读写比高，事务性强 | 读己之写，CAS / 乐观锁，多表事务 |
+| IdempotencyStore | 幂等键、writeSeq 区间、payloadDigest、提交状态 | 高写入，区间级索引，45 天 TTL | 与数据存储同事务同库 |
+| 数据存储 | 中心侧采集数据持久化 | 时序写入，高吞吐，范围查询，降采样聚合 | 与幂等存储同事务同库，按时间分区，自动压缩和保留 |
+
+### 30.2 选型对比
+
+#### 30.2.1 MySQL vs PostgreSQL
+
+| 维度 | MySQL (InnoDB) | PostgreSQL |
+|------|----------------|------------|
+| 读己之写 | 同事务内可保证，replica 读不保证 | 同上，声明式复制槽更可控 |
+| CAS / 乐观锁 | `UPDATE ... WHERE version = ?`，需检查 affected rows | 同样支持，`RETURNING` 子句更优雅 |
+| 并发写范围索引 | GAP lock / next-key lock 容易死锁 | MVCC 无 range lock，并发写入更顺滑 |
+| 声明式分区 | MySQL 8.0+ 成熟，分区裁剪不够稳定 | PG 10+ 成熟，PG 15+ 非常可靠 |
+| Upsert 语义 | `ON DUPLICATE KEY UPDATE` 先删后插，auto_increment 有坑 | `ON CONFLICT ... DO UPDATE` 不改行号，更干净 |
+| 索引类型 | B-tree, Hash, Full-text, R-tree | **B-tree, BRIN, GiST, GIN, Hash, SP-GiST** |
+| 时序扩展 | 无原生时序扩展 | **TimescaleDB**（PG 扩展，非独立数据库） |
+| 生态扩展 | 无 | TimescaleDB, PostGIS, pg_cron, pg_partman |
+
+**BRIN 索引是决定性差异。** 幂等区间查询按 `customerId + taskId + agentId + writeSeq range` 做范围扫描，writeSeq 单调递增，BRIN 索引对物理排序数据的空间效率是 B-tree 的 1/50 到 1/100，查询性能几乎不差。MySQL 没有等价索引类型。
+
+#### 30.2.2 是否引入独立时序数据库
+
+独立时序数据库（InfluxDB、TDengine、IoTDB）在时序写入、压缩和聚合查询上有优势，但无法满足 v0.5 原子提交硬约束：
+
+- 它们不支持跨表事务，更不支持与外部关系型数据库的分布式事务。
+- 如果数据存 TSDB、幂等存 PG，就必须引入两阶段提交或可恢复写入日志，违背 §13 排除的方案。
+- 即使某些 TSDB 支持"幂等写入"（如 InfluxDB 的行级去重），其去重机制不能替代架构要求的"数据 + 幂等记录同一原子提交"，因为它们无法表达"幂等键已写入但数据未写入"的一致性判断。
+
+**结论：第一版不引入独立时序数据库，而是通过 PostgreSQL 扩展获得时序能力。**
+
+### 30.3 选型结论
+
+```text
+第一版统一采用 PostgreSQL + TimescaleDB 承载全部中心侧存储。
+```
+
+架构拓扑：
+
+```text
+┌─────────────────────────────────────────────┐
+│     PostgreSQL + TimescaleDB 扩展            │
+│                                             │
+│  ┌──────────────────┐  ┌─────────────────┐  │
+│  │ GatewayMetadata  │  │ IdempotencyStore│  │
+│  │ Store            │  │ (普通 PG 表)     │  │
+│  │ (普通 PG 表)     │  │  + BRIN 索引    │  │
+│  │  + B-tree 索引   │  │  + 45天保留策略  │  │
+│  └──────────────────┘  └────────┬────────┘  │
+│                                 │ 同事务     │
+│  ┌──────────────────────────────┴─────────┐  │
+│  │ 数据存储 (TimescaleDB Hypertable)       │  │
+│  │  + 自动时间分区                         │  │
+│  │  + 7天自动压缩                          │  │
+│  │  + 持续聚合（分钟/小时级预计算）         │  │
+│  │  + 保留策略                             │  │
+│  └────────────────────────────────────────┘  │
+└─────────────────────────────────────────────┘
+```
+
+一个数据库实例，三种逻辑存储，满足全部架构约束。
+
+### 30.4 架构约束匹配验证
+
+| 架构约束 | 选型匹配 | 说明 |
+|----------|----------|------|
+| 数据写入与幂等提交记录同一原子提交单元 | ✅ | 同一 PG 实例、同一事务、`BEGIN ... INSERT ... INSERT ... COMMIT` |
+| 读己之写 | ✅ | PG 默认 READ COMMITTED + 主库读写满足；如需更强可切 SERIALIZABLE |
+| CAS / 乐观锁 | ✅ | `UPDATE ... SET version = version + 1 WHERE version = ? RETURNING version` |
+| 幂等区间索引空间可控 | ✅ | BRIN 索引，writeSeq 单调递增，索引大小约为 B-tree 的 1/50 ~ 1/100 |
+| 按时间范围查询采集数据 | ✅ | Hypertable 自动按 event_time 分区，分区裁剪 |
+| 热数据 45 天后压缩 | ✅ | TimescaleDB 压缩策略 + 保留策略 |
+| 下游分钟/小时聚合 | ✅ | TimescaleDB Continuous Aggregates 自动预计算 |
+| 数据唯一性约束 | ✅ | `PRIMARY KEY (customer_id, task_id, agent_id, write_seq)`，`ON CONFLICT DO NOTHING` |
+| 幂等冲突检测（相同键不同摘要） | ✅ | `INSERT ... ON CONFLICT ... DO UPDATE SET ... WHERE payload_digest = EXCLUDED.payload_digest`，不匹配则触发 FINAL_FAILURE |
+| 无状态 Gateway 可水平扩展 | ✅ | PG 作为共享状态存储，任意 Gateway Ingest 实例可查询同一幂等空间 |
+| 备份恢复一致性 | ✅ | `pg_dump` / `pg_basebackup` 天然保证同实例数据 + 幂等状态一致 |
+
+### 30.5 逻辑表设计方向
+
+以下为逻辑表设计方向，不属于 DDL。具体字段类型、索引参数、分区策略和压缩配置属于数据面详细设计。
+
+GatewayMetadataStore 核心表方向：
+
+- `customer`：租户主表
+- `agent`：Agent 注册、凭证、状态、版本
+- `data_source`：数据源、连通性、凭证引用
+- `point`：工业过程点
+- `collector_task`：任务、分配关系、版本、期望状态
+- `connector_type`：采集器类型、能力声明
+- `connector_package_version`：程序包版本、hash、signature、downloadUrl
+- `audit_log`：审计日志
+
+IdempotencyStore 表方向：
+
+- `idempotency_commit`：批次区间级幂等提交记录
+  - 主键：`customer_id + task_id + agent_id + first_write_seq + last_write_seq`
+  - 索引：BRIN on `write_seq`，B-tree on `(customer_id, task_id, committed_at)`
+  - 字段：record_count, payload_digest, checkpoint_candidate_digest, committed_at
+  - 保留：45 天后按 confirmed writeSeq range 清理
+
+数据存储表方向：
+
+- `sample_data`（Hypertable）：采集数据
+  - 主键：`customer_id + task_id + agent_id + write_seq`
+  - 时间分区列：`event_time`
+  - 压缩策略：7 天后 Segment-wise 列式压缩
+  - 保留策略：按业务需求配置，默认与幂等窗口对齐
+  - 持续聚合：按 customer_id + task_id + point 标识做分钟/小时级聚合
+
+### 30.6 规模演进路径
+
+第一版按 `<= 10` 高密度 Agent、`150000 samples/s` 设计余量。PostgreSQL + TimescaleDB 在合理硬件配置下（NVMe SSD、64GB+ 内存）可承载该吞吐。
+
+后续规模超过第一版时的演进路径：
+
+- 读写分离：metadata 写主库，数据查询走 streaming replica
+- 按客户分库（schema 隔离或独立实例）
+- 冷数据迁移到对象存储（Parquet 格式），通过外部表或数据湖查询
+- 引入专门 OLAP 引擎（如 ClickHouse）做分析查询，PG 仍作为主写入和幂等判断路径
+- 数据写入层不改动，只扩展查询层
+
+以上演进路径在第一版详细设计中不需实现，但元数据表和幂等表的主键设计不应阻碍后续按客户分库。
+
+### 30.7 详细设计门禁更新
+
+基于本选型决策，§26.9 详细设计门禁清单中以下条目状态更新：
+
+- ~~已选定或验证数据存储支持数据写入与幂等提交记录的同一原子提交单元~~ ✅ PostgreSQL + TimescaleDB 同实例同事务，已验证可行。
+- ~~具体存储产品选型~~ ✅ 已冻结为 PostgreSQL + TimescaleDB。
+
+剩余未闭环门禁：
+
+- 首批目标 ConnectorType 的真实 payload、批大小和放大系数已完成容量校准。
