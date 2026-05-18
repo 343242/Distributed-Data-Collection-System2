@@ -12,6 +12,7 @@
 | v0.6 | 2026-04-29 | 根据 v0.5 Web 评审补齐架构图索引、接口契约、状态机转移、数据产品边界、备份恢复、时间语义、ConnectorType 能力、运维处置、验收矩阵和部署前提。 |
 | v0.7 | 2026-05-19 | 根据 v0.6 审查补齐 storageStreamId 定义、ENABLED→DISABLED 直接跳转处置语义、observed version 精确定义和收敛判断两步机制、BatchState 终态补充、catch-up lease 基本属性、GatewayMetadataStore 读己之写选型门禁和大白话版版本对应声明。 |
 | v0.8 | 2026-05-19 | 冻结第一版存储选型决策：PostgreSQL + TimescaleDB 统一承载 GatewayMetadataStore、IdempotencyStore 和数据存储，满足数据写入与幂等提交记录同一原子提交单元的硬约束。补充选型依据、架构约束匹配分析和部署拓扑。 |
+| v0.9 | 2026-05-19 | 冻结 payload 编码方案假设和容量校准结论：Connector 输出采用 point index 字典编码而非每条样本携带字符串 point_id，单条样本二进制 payload 约 30-50B，容量基线成立。补齐 §26.9 最后一项门禁。 |
 
 ## 1. 设计目标
 
@@ -895,6 +896,35 @@ Agent 本地读写性能：
 
 上述估算以平均 payload `50B` 为参考。实际容量还必须计入记录头、Block 头、WAL 冗余窗口、Segment 尾元数据、Cursor、Checkpoint 和文件系统开销。
 
+v0.9 冻结 payload 编码方案假设：
+
+`50B` 是基于以下二进制编码方案的合理估算，不是随意取值：
+
+```text
+单条样本二进制 payload 组成：
+  point_index:  4B (uint32，通过字典编码映射到完整 point_id)
+  timestamp:    8B (int64，毫秒级 Unix 时间戳)
+  value:        4B 或 8B (float32 或 float64)
+  quality_code: 1B (uint8，质量码)
+  ----------------------------------------
+  业务 payload 合计: 约 17-21B
+
+加上记录级开销（record header、length、crc）约 10-15B，
+加上 Block 级和 Segment 级元数据均摊约 10-15B/条，
+单条样本综合开销约 30-50B。
+```
+
+关键编码约定：
+
+- **point_id 字典编码**：Connector 启动时从 CollectorTask 关联的 DataSource/Point 配置获取点位列表，按分配顺序生成 `point_index`（uint32）。完整 point 元数据（位号名、描述、工程单位、报警限值等）作为任务级静态配置存入中心元数据，不随每条样本重复传输。
+- **value 编码**：float32 适用于大多数过程量（温度、压力、流量、液位等）；需要双精度的场景使用 float64，payload 增加约 4B。
+- **quality_code**：1 字节位域编码，覆盖正常、可疑、无效、缺失等状态，与 OPC UA Quality 或等价工业标准对齐。
+- **不使用 JSON**：高频工业过程点采集的第一版 payload 采用二进制编码，不使用 JSON 或其他文本编码。JSON 编码会导致单条样本膨胀到 100-300B，使 30 天容量估算翻 3-6 倍。
+
+如果后续新增的 ConnectorType 输出格式不同（如日志采集、事件采集），其 payload 大小需要单独评估，不影响工业过程点的容量基线。
+
+该编码方案假设属于 Connector SDK 和 schemaVersion 契约的一部分，详细设计阶段应在 Connector SDK 接口定义中锁定编码规范。
+
 `50B payload` 是容量规划关键假设，必须在详细设计中按实际 ConnectorType 输出重新验证。若平均 payload 变为 `200B`，同等速率下 payload 容量约扩大 `4` 倍；若变为 `500B`，约扩大 `10` 倍。任何超过 `100B` 的平均 payload 都应重新计算 30 天缓存磁盘、Gateway 带宽、幂等索引和中心存储容量。
 
 v0.5 决策：容量基线在真实 payload 校准前只能作为架构估算，不能直接下沉为硬件采购指标、性能验收指标或详细设计容量承诺。
@@ -1588,7 +1618,7 @@ Connector SDK 或等价本地提交适配层至少需要定义：
 - ~~状态机转移表已经覆盖 DesiredState、TaskRuntimeState、InstanceState 和 BatchState。~~ ✅ v0.6/v0.7
 - ~~数据写入、幂等、ACK、Checkpoint 的失败矩阵已经冻结。~~ ✅ v0.5
 - ~~数据存储与幂等提交记录的原子提交边界已被目标存储方案验证。~~ ✅ v0.8（PostgreSQL + TimescaleDB 同实例同事务）
-- 首批目标 ConnectorType 的真实 payload、批大小和放大系数已经完成容量校准。
+- ~~首批目标 ConnectorType 的真实 payload、批大小和放大系数已经完成容量校准。~~ ✅ v0.9（工业过程点场景采用 point index 字典编码 + 二进制 payload，单条约 30-50B，容量基线成立）
 - ~~备份恢复边界和"幂等状态不能领先于数据恢复"的约束已经明确。~~ ✅ v0.6
 - ~~ConnectorType 能力声明模板已经形成。~~ ✅ v0.6
 - ~~故障注入与验收矩阵已经纳入 v1 验收计划。~~ ✅ v0.6
@@ -1663,6 +1693,8 @@ v0.6 进一步补齐评审闭环材料：将部署拓扑图、逻辑组件图和
 v0.7 进一步补齐 v0.6 审查发现的精确性缺口：明确 storageStreamId 等于 taskId；定义 ENABLED→DISABLED 直接跳转的 Agent 行为为立即停采集但继续排空上传；明确 observed version 为已持久化并开始执行，Gateway 收敛判断拆为指令送达和状态收敛两步；补充 BatchState 终态 PURGED 和 ABANDONED；补充 catch-up lease TTL 和过期行为；补充 GatewayMetadataStore 读己之写选型门禁。
 
 v0.8 冻结第一版存储选型决策。选型结论和依据见第 30 节。
+
+v0.9 冻结 payload 编码方案假设：Connector 输出采用 point index 字典编码 + 二进制 payload，单条样本约 30-50B，50B 容量假设成立。§26.9 详细设计门禁清单全部闭环。
 
 ## 30. 第一版存储选型决策
 
@@ -1815,6 +1847,8 @@ IdempotencyStore 表方向：
 - ~~已选定或验证数据存储支持数据写入与幂等提交记录的同一原子提交单元~~ ✅ PostgreSQL + TimescaleDB 同实例同事务，已验证可行。
 - ~~具体存储产品选型~~ ✅ 已冻结为 PostgreSQL + TimescaleDB。
 
-剩余未闭环门禁：
+~~剩余未闭环门禁~~：
 
-- 首批目标 ConnectorType 的真实 payload、批大小和放大系数已完成容量校准。
+- ~~首批目标 ConnectorType 的真实 payload、批大小和放大系数已完成容量校准。~~ ✅ v0.9
+
+**§26.9 详细设计门禁清单全部闭环。可以进入详细设计阶段。**
